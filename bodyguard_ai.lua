@@ -121,6 +121,85 @@ local function request(model, messages)
     return text, code
 end
 
+-- ═══ MODEL DISCOVERY ═══════════════════════════════════════════════════════════════════════════
+-- Groq retires models often. When a model is gone (404) the module asks Groq which models are live
+-- right now and picks a small, fast chat model automatically.
+local activeModel = nil        -- the model that last worked
+local lastDiscoverAt = -1e9
+
+local SKIP = {"whisper", "guard", "tts", "orpheus", "playai", "embed", "compound", "safeguard", "moderation", "transcri"}
+local PREFER = {"instant", "gpt-oss-20b", "8b", "llama", "gemma", "qwen", "gpt-oss"} -- earlier = preferred
+
+local function discoverModels()
+    if os.clock() - lastDiscoverAt < 60 then return {} end
+    lastDiscoverAt = os.clock()
+
+    local url = URL:gsub("/chat/completions$", "/models")
+    local ok, res = pcall(API.httpRequest, {
+        Url = url,
+        Method = "GET",
+        Headers = {["Authorization"] = "Bearer " .. KEY},
+    })
+    if not ok or type(res) ~= "table" or (res.StatusCode or 0) ~= 200 then
+        warn("[bodyguard-ai] could not load the model list (HTTP " .. tostring(ok and type(res) == "table" and res.StatusCode or "?") .. ")")
+        return {}
+    end
+    local okJson, data = pcall(HttpService.JSONDecode, HttpService, res.Body or "")
+    if not okJson or type(data) ~= "table" or type(data.data) ~= "table" then return {} end
+
+    local found = {}
+    for _, m in ipairs(data.data) do
+        local id = type(m) == "table" and m.id
+        if type(id) == "string" and m.active ~= false then
+            local low, skip = string.lower(id), false
+            for _, bad in ipairs(SKIP) do
+                if low:find(bad, 1, true) then skip = true; break end
+            end
+            if not skip then table.insert(found, id) end
+        end
+    end
+
+    local function rank(id)
+        local low = string.lower(id)
+        for i, word in ipairs(PREFER) do
+            if low:find(word, 1, true) then return i end
+        end
+        return #PREFER + 1
+    end
+    table.sort(found, function(x, y)
+        local rx, ry = rank(x), rank(y)
+        if rx ~= ry then return rx < ry end
+        return x < y
+    end)
+
+    print("[bodyguard-ai] models available on your key: " .. table.concat(found, ", "))
+    return found
+end
+
+-- tries each model until one answers. returns text | nil, last HTTP code, fatal (bad key)
+local function tryModels(list, messages)
+    local lastCode = 0
+    for i, model in ipairs(list) do
+        if i > 4 then break end -- don't hammer the API
+        local text, code, body = request(model, messages)
+        if text then
+            text = clean(text)
+            if text ~= "" then
+                if activeModel ~= model then
+                    activeModel = model
+                    print("[bodyguard-ai] using model: " .. model)
+                end
+                return text, 200
+            end
+        end
+        lastCode = code or 0
+        warn(string.format("[bodyguard-ai] %s failed (HTTP %s): %s", model, tostring(code), string.sub(tostring(body), 1, 200)))
+        if code == 401 or code == 403 then return nil, lastCode, true end -- bad key: another model won't help
+        if code == 404 and model == activeModel then activeModel = nil end
+    end
+    return nil, lastCode
+end
+
 -- returns the answer text, or nil + the HTTP code
 local function ask(userText)
     table.insert(history, {role = "user", content = userText})
@@ -129,24 +208,27 @@ local function ask(userText)
     local messages = {{role = "system", content = persona()}}
     for _, m in ipairs(history) do table.insert(messages, m) end
 
-    local lastCode = 0
-    for _, model in ipairs(MODELS) do
-        local text, code, body = request(model, messages)
-        if text then
-            text = clean(text)
-            if text ~= "" then
-                table.insert(history, {role = "assistant", content = text})
-                while #history > HISTORY_MAX do table.remove(history, 1) end
-                return text
-            end
-        end
-        lastCode = code or 0
-        warn(string.format("[bodyguard-ai] %s failed (HTTP %s): %s", model, tostring(code), string.sub(tostring(body), 1, 200)))
-        if code == 401 or code == 403 then break end -- bad key: trying another model won't help
+    local list = {}
+    if activeModel then table.insert(list, activeModel) end
+    for _, m in ipairs(MODELS) do
+        if m ~= activeModel then table.insert(list, m) end
+    end
+
+    local text, code, fatal = tryModels(list, messages)
+    -- the configured models are gone (404) / rejected (400): ask Groq what is live and use that
+    if not text and not fatal and (code == 404 or code == 400) then
+        local found = discoverModels()
+        if #found > 0 then text, code = tryModels(found, messages) end
+    end
+
+    if text then
+        table.insert(history, {role = "assistant", content = text})
+        while #history > HISTORY_MAX do table.remove(history, 1) end
+        return text
     end
 
     table.remove(history) -- the question got no answer: forget it
-    return nil, lastCode
+    return nil, code or 0
 end
 
 -- ═══ CHAT HANDLING ══════════════════════════════════════════════════════════════════════════════
