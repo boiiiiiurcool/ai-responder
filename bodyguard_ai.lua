@@ -1,0 +1,223 @@
+-- ═══ BODYGUARD AI CHAT MODULE ═══════════════════════════════════════════════════════════════════
+-- Separate file (host it on GitHub). It is loaded by bodyguard.lua, which hands it a small API table
+-- (getgenv().__BodyguardAPI), so this file does nothing on its own.
+--
+-- The OWNER types in chat:   !bot <anything>
+-- -> ONE bot (the same "chatter" bot that types the kill lines) asks the AI and answers in chat.
+-- Only the owner is listened to (checked by UserId, so a stranger can't fake it with a display name).
+--
+-- AI: Groq free tier (no credit card). Key: https://console.groq.com/keys  (starts with "gsk_")
+-- Other OpenAI-compatible providers work too: change C.AI_URL / C.AI_MODEL in bodyguard.lua.
+
+local env = (getgenv and getgenv()) or _G
+local API = env.__BodyguardAPI
+if type(API) ~= "table" then
+    warn("[bodyguard-ai] this module is loaded by bodyguard.lua - run that script instead")
+    return
+end
+
+local C = API.config
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local TextChatService = game:GetService("TextChatService")
+
+-- ═══ SETTINGS (all can be overridden from bodyguard.lua through the C.AI_* values) ══════════════
+local KEY = (type(C.AI_KEY) == "string" and C.AI_KEY ~= "" and C.AI_KEY) or env.BodyguardAIKey
+local URL         = C.AI_URL or "https://api.groq.com/openai/v1/chat/completions"
+local TRIGGER     = string.lower(C.AI_TRIGGER or "!bot")
+local MODELS      = {C.AI_MODEL or "llama-3.3-70b-versatile", C.AI_FALLBACK_MODEL or "llama-3.1-8b-instant"}
+local COOLDOWN    = C.AI_COOLDOWN or 3        -- seconds between answers (protects the free-tier rate limit)
+local HISTORY_MAX = C.AI_HISTORY or 8         -- how many past messages the AI remembers
+local MAX_CHUNKS  = C.AI_MAX_CHUNKS or 3      -- an answer is cut into at most this many chat messages
+local CHUNK_LEN   = 190                       -- Roblox chat limit is 200 characters
+
+local DEFAULT_PERSONA = "You are a friendly bodyguard bot standing next to {owner} in a Roblox game, "
+    .. "and you are chatting with {owner} in the game chat. Reply with ONE short message of at most 180 "
+    .. "characters. Plain text only: no markdown, no emojis, no line breaks. Casual, a bit funny and "
+    .. "loyal to {owner}. If the question needs a long answer, give the short version."
+
+if type(KEY) ~= "string" or KEY == "" then
+    warn("[bodyguard-ai] no API key. Put your free Groq key in C.AI_KEY (bodyguard.lua) or set "
+        .. "getgenv().BodyguardAIKey = \"gsk_...\" before running the script. Get one at console.groq.com/keys")
+    return
+end
+if not API.httpRequest then
+    warn("[bodyguard-ai] your executor has no request function - the AI chat can't work")
+    return
+end
+
+-- ═══ HELPERS ════════════════════════════════════════════════════════════════════════════════════
+local history = {}          -- {role = "user" | "assistant", content = "..."}
+local busy, lastAnswerAt = false, 0
+local lastText, lastTextAt = nil, 0
+
+local function persona()
+    local owner = API.ownerPlayer()
+    local ownerName = owner and owner.DisplayName or API.owner
+    local text = (C.AI_PERSONA or DEFAULT_PERSONA):gsub("{owner}", function() return ownerName end)
+    return text
+end
+
+-- chat-safe text: no newlines / markdown, single spaces
+local function clean(t)
+    t = t:gsub("%c+", " ")
+    t = t:gsub("[%*_`#]", "")
+    t = t:gsub("%s+", " ")
+    t = t:gsub("^%s+", "")
+    t = t:gsub("%s+$", "")
+    return t
+end
+
+-- cut a long answer into chat-sized pieces (at spaces where possible)
+local function split(text)
+    local parts = {}
+    while #text > CHUNK_LEN and #parts < MAX_CHUNKS - 1 do
+        local cut = CHUNK_LEN
+        local sp = text:sub(1, CHUNK_LEN):match(".*()%s")
+        if sp and sp > 40 then cut = sp - 1 end
+        local piece = text:sub(1, cut):gsub("%s+$", "")
+        table.insert(parts, piece)
+        text = text:sub(cut + 1):gsub("^%s+", "")
+    end
+    if #text > CHUNK_LEN then text = text:sub(1, CHUNK_LEN - 3) .. "..." end
+    if #text > 0 then table.insert(parts, text) end
+    return parts
+end
+
+local function say(text)
+    local parts = split(text)
+    for i, part in ipairs(parts) do
+        if not API.isRunning() then return end
+        if not utf8.len(part) then part = part:gsub("[\128-\255]", "") end -- never send broken UTF-8
+        API.sendChat(part)
+        if i < #parts then task.wait(1.8) end
+    end
+end
+
+-- ═══ AI REQUEST ═════════════════════════════════════════════════════════════════════════════════
+local function request(model, messages)
+    local ok, res = pcall(API.httpRequest, {
+        Url = URL,
+        Method = "POST",
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["Authorization"] = "Bearer " .. KEY,
+        },
+        Body = HttpService:JSONEncode({
+            model = model,
+            messages = messages,
+            max_tokens = 150,
+            temperature = 0.8,
+        }),
+    })
+    if not ok or type(res) ~= "table" then return nil, 0, tostring(res) end
+    local code = res.StatusCode or 0
+    if code < 200 or code >= 300 then return nil, code, tostring(res.Body or "") end
+
+    local okJson, data = pcall(HttpService.JSONDecode, HttpService, res.Body or "")
+    local text = okJson and type(data) == "table" and data.choices and data.choices[1]
+        and data.choices[1].message and data.choices[1].message.content
+    if type(text) ~= "string" or text == "" then return nil, code, "empty answer" end
+    return text, code
+end
+
+-- returns the answer text, or nil + the HTTP code
+local function ask(userText)
+    table.insert(history, {role = "user", content = userText})
+    while #history > HISTORY_MAX do table.remove(history, 1) end
+
+    local messages = {{role = "system", content = persona()}}
+    for _, m in ipairs(history) do table.insert(messages, m) end
+
+    local lastCode = 0
+    for _, model in ipairs(MODELS) do
+        local text, code, body = request(model, messages)
+        if text then
+            text = clean(text)
+            if text ~= "" then
+                table.insert(history, {role = "assistant", content = text})
+                while #history > HISTORY_MAX do table.remove(history, 1) end
+                return text
+            end
+        end
+        lastCode = code or 0
+        warn(string.format("[bodyguard-ai] %s failed (HTTP %s): %s", model, tostring(code), string.sub(tostring(body), 1, 200)))
+        if code == 401 or code == 403 then break end -- bad key: trying another model won't help
+    end
+
+    table.remove(history) -- the question got no answer: forget it
+    return nil, lastCode
+end
+
+-- ═══ CHAT HANDLING ══════════════════════════════════════════════════════════════════════════════
+-- text = something the OWNER said in chat
+local function handle(text)
+    if type(text) ~= "string" or not API.isRunning() then return end
+    if not API.isChatter() then return end -- only one bot answers
+
+    -- must start with the trigger, as its own word ("!bot hi" yes, "!bots" / "!botfoo" no)
+    if string.lower(text):sub(1, #TRIGGER) ~= TRIGGER then return end
+    local rest = text:sub(#TRIGGER + 1)
+    if rest ~= "" and not rest:match("^%s") then return end
+    rest = rest:gsub("^%s+", ""):gsub("%s+$", "")
+
+    -- the same message can arrive through both chat systems: handle it once
+    local now = os.clock()
+    if text == lastText and now - lastTextAt < 2 then return end
+    lastText, lastTextAt = text, now
+
+    if busy or now - lastAnswerAt < COOLDOWN then return end
+    busy = true
+
+    task.spawn(function()
+        local ok, err = pcall(function()
+            local lower = string.lower(rest)
+            if rest == "" then
+                task.wait(0.5)
+                say("yo, what's up?")
+                return
+            elseif lower == "clear" or lower == "reset" then
+                table.clear(history)
+                task.wait(0.5)
+                say("memory cleared")
+                return
+            end
+
+            local answer, code = ask(rest)
+            task.wait(0.4) -- tiny pause so it reads like typing
+            if answer then
+                say(answer)
+            elseif code == 429 then
+                say("too many questions, try again in a bit")
+            end
+            -- any other failure is only printed to the console (see the warn above)
+        end)
+        if not ok then warn("[bodyguard-ai] error: " .. tostring(err)) end
+        lastAnswerAt = os.clock()
+        busy = false
+    end)
+end
+
+local function isOwnerId(userId)
+    local owner = API.ownerPlayer()
+    return owner ~= nil and owner.UserId == userId
+end
+
+-- new chat (TextChatService)
+pcall(function()
+    API.addConn(TextChatService.MessageReceived:Connect(function(message)
+        local source = message.TextSource
+        if source and isOwnerId(source.UserId) then handle(message.Text) end
+    end))
+end)
+
+-- legacy chat: listen to the owner's Chatted event
+local function hookOwner(p)
+    if string.lower(p.Name) == string.lower(API.owner) then
+        API.addConn(p.Chatted:Connect(handle))
+    end
+end
+for _, p in ipairs(Players:GetPlayers()) do hookOwner(p) end
+API.addConn(Players.PlayerAdded:Connect(hookOwner))
+
+print(string.format("[bodyguard-ai] loaded | say \"%s <message>\" in chat | model: %s", TRIGGER, MODELS[1]))
