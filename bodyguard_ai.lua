@@ -116,12 +116,64 @@ local function split(text)
     return parts
 end
 
+-- sends ONE chat message and tells you in the console what chat answered (so a silent failure can't hide)
+local function speak(msg)
+    local done, result = false, nil
+    task.spawn(function()
+        local ok, err = pcall(function()
+            if TextChatService.ChatVersion == Enum.ChatVersion.TextChatService then
+                local channels = TextChatService:FindFirstChild("TextChannels")
+                local channel = channels and channels:FindFirstChild("RBXGeneral")
+                if channels and not channel then
+                    for _, ch in ipairs(channels:GetChildren()) do
+                        if ch:IsA("TextChannel") then channel = ch; break end
+                    end
+                end
+                if channel then
+                    local res = channel:SendAsync(msg)
+                    result = {via = "channel " .. channel.Name, status = res and tostring(res.Status) or "no status"}
+                    return
+                end
+            end
+            local events = game:GetService("ReplicatedStorage"):FindFirstChild("DefaultChatSystemChatEvents")
+            local say = events and events:FindFirstChild("SayMessageRequest")
+            if say then
+                say:FireServer(msg, "All")
+                result = {via = "legacy chat", status = "fired"}
+            end
+        end)
+        if not ok then result = {via = "error", status = tostring(err)} end
+        done = true
+    end)
+
+    local waited = 0
+    while not done and waited < 4 do waited += task.wait(0.05) end
+    if not done then
+        warn("[bodyguard-ai] chat did not answer within 4s (the message may or may not have been sent)")
+        return false
+    end
+    if not result then
+        warn("[bodyguard-ai] found no chat channel to send the reply in")
+        return false
+    end
+    if result.status:find("Success", 1, true) or result.status == "fired" then
+        print("[bodyguard-ai] reply sent (" .. result.via .. ")")
+        return true
+    end
+    warn("[bodyguard-ai] chat did NOT accept the reply (" .. result.via .. "): " .. result.status)
+    if result.status:find("Permission", 1, true) or result.status:find("Unknown", 1, true) then
+        warn("[bodyguard-ai] this usually means the account is not allowed to chat (Roblox chat restrictions on new / unverified alts)")
+    end
+    return false
+end
+
 local function say(text)
+    print("[bodyguard-ai] answer: " .. text)
     local parts = split(text)
     for i, part in ipairs(parts) do
         if not API.isRunning() then return end
         if not utf8.len(part) then part = part:gsub("[\128-\255]", "") end -- never send broken UTF-8
-        API.sendChat(part)
+        speak(part)
         if i < #parts then task.wait(1.8) end
     end
 end
@@ -272,23 +324,46 @@ local function ask(userText)
 end
 
 -- ═══ CHAT HANDLING ══════════════════════════════════════════════════════════════════════════════
--- returns the question when the message is addressed to THIS bot, otherwise nil:
---   "BotName how are you"  /  "BotName, how are you?"  /  "botname: hi"   (username or display name)
+-- returns the question when the message is addressed to THIS bot, otherwise nil. The message has to start
+-- with the bot's USERNAME or DISPLAY NAME (any capitals), optionally with "@" or "hey / yo / hi" before it:
+--   "BotName how are you"  /  "BotName, how are you?"  /  "@botname hi"  /  "yo botname what's up"
 --   (optional) "!bot ..." answered by the chatter bot when C.AI_TRIGGER is set
+local GREETINGS = {hey = true, yo = true, hi = true, hello = true, ok = true, okay = true, ay = true, aye = true}
+
 local function addressedToMe(text)
-    local low = string.lower(text)
-    local function after(prefix) -- prefix is lowercase
-        if prefix == "" or low:sub(1, #prefix) ~= prefix then return nil end
+    text = text:gsub("^%s+", "")
+    local variants = {text}
+    local noAt = text:gsub("^@", "")
+    if noAt ~= text then table.insert(variants, noAt) end
+    local word, tail = text:match("^(%a+)%s+(.+)$")
+    if word and GREETINGS[string.lower(word)] then
+        table.insert(variants, tail)
+        table.insert(variants, (tail:gsub("^@", "")))
+    end
+
+    local function after(str, prefix) -- prefix is lowercase
+        if prefix == "" then return nil end
+        local low = string.lower(str)
+        if low:sub(1, #prefix) ~= prefix then return nil end
         local nextChar = low:sub(#prefix + 1, #prefix + 1)
         if nextChar ~= "" and nextChar:match("[%w_]") then return nil end -- "Bot1" must not match "Bot12"
-        local rest = text:sub(#prefix + 1)
+        local rest = str:sub(#prefix + 1)
         rest = rest:gsub("^[%s,:;%.!%?%-]+", ""):gsub("%s+$", "")
         return rest
     end
+
     local me = API.player
-    local rest = after(string.lower(me.Name)) or after(string.lower(me.DisplayName))
-    if rest then return rest end
-    if TRIGGER ~= "" and API.isChatter() then return after(TRIGGER) end
+    local names = {string.lower(me.Name), string.lower(me.DisplayName)}
+    for _, str in ipairs(variants) do
+        for _, name in ipairs(names) do
+            local rest = after(str, name)
+            if rest then return rest end
+        end
+        if TRIGGER ~= "" and API.isChatter() then
+            local rest = after(str, TRIGGER)
+            if rest then return rest end
+        end
+    end
     return nil
 end
 
@@ -357,4 +432,15 @@ end
 for _, p in ipairs(Players:GetPlayers()) do hookOwner(p) end
 API.addConn(Players.PlayerAdded:Connect(hookOwner))
 
-print(string.format("[bodyguard-ai] loaded | say \"%s <message>\" in chat to talk to this bot", API.player.Name))
+-- can this account chat at all? (new / restricted alts can't, and then no reply can ever show up)
+task.spawn(function()
+    local ok, can = pcall(function() return TextChatService:CanUserChatAsync(API.player.UserId) end)
+    if ok and can == false then
+        warn("[bodyguard-ai] Roblox says THIS ACCOUNT IS NOT ALLOWED TO CHAT, so it can never reply. "
+            .. "Fix the account (Roblox Settings > Privacy > Communication, age / verification) or use another alt.")
+    elseif ok then
+        print("[bodyguard-ai] chat permission check: this account can chat")
+    end
+end)
+
+print(string.format("[bodyguard-ai] loaded | say \"%s <message>\" (or \"%s <message>\") in chat to talk to this bot", API.player.Name, API.player.DisplayName))
