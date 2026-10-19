@@ -131,6 +131,13 @@ local function speak(msg)
                 end
                 if channel then
                     local res = channel:SendAsync(msg)
+                    -- SendAsync hands back the message while it is still "Sending": wait for the final status
+                    if res then
+                        local t = 0
+                        while res.Status == Enum.TextChatMessageStatus.Sending and t < 3 do
+                            t += task.wait(0.1)
+                        end
+                    end
                     result = {via = "channel " .. channel.Name, status = res and tostring(res.Status) or "no status"}
                     return
                 end
@@ -147,22 +154,28 @@ local function speak(msg)
     end)
 
     local waited = 0
-    while not done and waited < 4 do waited += task.wait(0.05) end
+    while not done and waited < 7 do waited += task.wait(0.05) end
     if not done then
-        warn("[bodyguard-ai] chat did not answer within 4s (the message may or may not have been sent)")
+        warn("[bodyguard-ai] chat did not answer within 7s (the message may or may not have been sent)")
         return false
     end
     if not result then
         warn("[bodyguard-ai] found no chat channel to send the reply in")
         return false
     end
-    if result.status:find("Success", 1, true) or result.status == "fired" then
+    local st = result.status
+    if st:find("Success", 1, true) or st == "fired" then
         print("[bodyguard-ai] reply sent (" .. result.via .. ")")
         return true
+    elseif st:find("Sending", 1, true) then
+        print("[bodyguard-ai] reply sent, chat has not confirmed it yet (" .. result.via .. ") - it should show up in chat")
+        return true
     end
-    warn("[bodyguard-ai] chat did NOT accept the reply (" .. result.via .. "): " .. result.status)
-    if result.status:find("Permission", 1, true) or result.status:find("Unknown", 1, true) then
-        warn("[bodyguard-ai] this usually means the account is not allowed to chat (Roblox chat restrictions on new / unverified alts)")
+    warn("[bodyguard-ai] chat did NOT accept the reply (" .. result.via .. "): " .. st)
+    if st:find("Flood", 1, true) then
+        warn("[bodyguard-ai] chat rate limit: the message was sent too soon after another one")
+    elseif st:find("Permission", 1, true) or st:find("Privacy", 1, true) then
+        warn("[bodyguard-ai] this account is not allowed to chat here (Roblox chat restrictions on new / unverified alts)")
     end
     return false
 end
