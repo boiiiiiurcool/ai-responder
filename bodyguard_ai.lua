@@ -30,11 +30,14 @@ local COOLDOWN    = C.AI_COOLDOWN or 3        -- seconds between answers (protec
 local HISTORY_MAX = C.AI_HISTORY or 8         -- how many past messages the AI remembers
 local MAX_CHUNKS  = C.AI_MAX_CHUNKS or 3      -- an answer is cut into at most this many chat messages
 local CHUNK_LEN   = 190                       -- Roblox chat limit is 200 characters
+local MAX_SENTENCES = C.AI_MAX_SENTENCES or 2  -- an answer is cut down to this many sentences
+local MAX_CHARS     = C.AI_MAX_CHARS or 110    -- ...and to this many characters
 
-local DEFAULT_PERSONA = "You are a friendly bodyguard bot standing next to {owner} in a Roblox game, "
-    .. "and you are chatting with {owner} in the game chat. Reply with ONE short message of at most 180 "
-    .. "characters. Plain text only: no markdown, no emojis, no line breaks. Casual, a bit funny and "
-    .. "loyal to {owner}. If the question needs a long answer, give the short version."
+local DEFAULT_PERSONA = "You are {bot}, a friendly bodyguard bot standing next to {owner} in a Roblox game. "
+    .. "You are chatting with {owner} in the game chat. Talk like a normal teenager texting a friend. "
+    .. "Use very simple words and VERY short sentences. Answer in 1 or 2 short sentences, under 100 "
+    .. "characters in total. Never write paragraphs, lists or long words. No markdown, no emojis, no "
+    .. "line breaks. Be casual, a bit funny and loyal to {owner}."
 
 if type(KEY) ~= "string" or KEY == "" then
     warn("[bodyguard-ai] no API key. Put your free Groq key in C.AI_KEY (bodyguard.lua) or set "
@@ -54,7 +57,10 @@ local lastText, lastTextAt = nil, 0
 local function persona()
     local owner = API.ownerPlayer()
     local ownerName = owner and owner.DisplayName or API.owner
-    local text = (C.AI_PERSONA or DEFAULT_PERSONA):gsub("{owner}", function() return ownerName end)
+    local botName = API.player.DisplayName
+    local text = (C.AI_PERSONA or DEFAULT_PERSONA)
+    text = text:gsub("{owner}", function() return ownerName end)
+    text = text:gsub("{bot}", function() return botName end)
     return text
 end
 
@@ -65,6 +71,32 @@ local function clean(t)
     t = t:gsub("%s+", " ")
     t = t:gsub("^%s+", "")
     t = t:gsub("%s+$", "")
+    return t
+end
+
+-- keep only the first sentences and a limited number of characters (so answers stay short and simple)
+local function shorten(t)
+    local pos, cutAt = 1, nil
+    for _ = 1, MAX_SENTENCES do
+        local _, e = t:find("[%.%!%?]+%s", pos)
+        if not e then cutAt = nil; break end
+        cutAt = e
+        pos = e + 1
+    end
+    if cutAt then t = t:sub(1, cutAt):gsub("%s+$", "") end
+
+    if #t > MAX_CHARS then
+        local head = t:sub(1, MAX_CHARS)
+        local stop = head:match(".*()[%.%!%?]")
+        local space = head:match(".*()%s")
+        if stop and stop > 25 then
+            t = head:sub(1, stop)
+        elseif space and space > 25 then
+            t = head:sub(1, space - 1)
+        else
+            t = head
+        end
+    end
     return t
 end
 
@@ -95,6 +127,17 @@ local function say(text)
 end
 
 -- ═══ AI REQUEST ═════════════════════════════════════════════════════════════════════════════════
+local function requestBody(model, messages)
+    local body = {
+        model = model,
+        messages = messages,
+        max_tokens = 600,   -- "thinking" models spend tokens on reasoning before the short answer
+        temperature = 0.7,
+    }
+    if string.lower(model):find("gpt-oss", 1, true) then body.reasoning_effort = "low" end
+    return body
+end
+
 local function request(model, messages)
     local ok, res = pcall(API.httpRequest, {
         Url = URL,
@@ -103,12 +146,7 @@ local function request(model, messages)
             ["Content-Type"] = "application/json",
             ["Authorization"] = "Bearer " .. KEY,
         },
-        Body = HttpService:JSONEncode({
-            model = model,
-            messages = messages,
-            max_tokens = 150,
-            temperature = 0.8,
-        }),
+        Body = HttpService:JSONEncode(requestBody(model, messages)),
     })
     if not ok or type(res) ~= "table" then return nil, 0, tostring(res) end
     local code = res.StatusCode or 0
@@ -117,7 +155,9 @@ local function request(model, messages)
     local okJson, data = pcall(HttpService.JSONDecode, HttpService, res.Body or "")
     local text = okJson and type(data) == "table" and data.choices and data.choices[1]
         and data.choices[1].message and data.choices[1].message.content
-    if type(text) ~= "string" or text == "" then return nil, code, "empty answer" end
+    if type(text) ~= "string" then return nil, code, "empty answer" end
+    text = text:gsub("<think>.-</think>", ""):gsub("<think>.*$", "") -- drop visible reasoning
+    if text:match("^%s*$") then return nil, code, "empty answer" end
     return text, code
 end
 
@@ -183,7 +223,7 @@ local function tryModels(list, messages)
         if i > 4 then break end -- don't hammer the API
         local text, code, body = request(model, messages)
         if text then
-            text = clean(text)
+            text = shorten(clean(text))
             if text ~= "" then
                 if activeModel ~= model then
                     activeModel = model
@@ -232,16 +272,31 @@ local function ask(userText)
 end
 
 -- ═══ CHAT HANDLING ══════════════════════════════════════════════════════════════════════════════
+-- returns the question when the message is addressed to THIS bot, otherwise nil:
+--   "BotName how are you"  /  "BotName, how are you?"  /  "botname: hi"   (username or display name)
+--   (optional) "!bot ..." answered by the chatter bot when C.AI_TRIGGER is set
+local function addressedToMe(text)
+    local low = string.lower(text)
+    local function after(prefix) -- prefix is lowercase
+        if prefix == "" or low:sub(1, #prefix) ~= prefix then return nil end
+        local nextChar = low:sub(#prefix + 1, #prefix + 1)
+        if nextChar ~= "" and nextChar:match("[%w_]") then return nil end -- "Bot1" must not match "Bot12"
+        local rest = text:sub(#prefix + 1)
+        rest = rest:gsub("^[%s,:;%.!%?%-]+", ""):gsub("%s+$", "")
+        return rest
+    end
+    local me = API.player
+    local rest = after(string.lower(me.Name)) or after(string.lower(me.DisplayName))
+    if rest then return rest end
+    if TRIGGER ~= "" and API.isChatter() then return after(TRIGGER) end
+    return nil
+end
+
 -- text = something the OWNER said in chat
 local function handle(text)
     if type(text) ~= "string" or not API.isRunning() then return end
-    if not API.isChatter() then return end -- only one bot answers
-
-    -- must start with the trigger, as its own word ("!bot hi" yes, "!bots" / "!botfoo" no)
-    if string.lower(text):sub(1, #TRIGGER) ~= TRIGGER then return end
-    local rest = text:sub(#TRIGGER + 1)
-    if rest ~= "" and not rest:match("^%s") then return end
-    rest = rest:gsub("^%s+", ""):gsub("%s+$", "")
+    local rest = addressedToMe(text)
+    if not rest then return end
 
     -- the same message can arrive through both chat systems: handle it once
     local now = os.clock()
@@ -302,4 +357,4 @@ end
 for _, p in ipairs(Players:GetPlayers()) do hookOwner(p) end
 API.addConn(Players.PlayerAdded:Connect(hookOwner))
 
-print(string.format("[bodyguard-ai] loaded | say \"%s <message>\" in chat | model: %s", TRIGGER, MODELS[1]))
+print(string.format("[bodyguard-ai] loaded | say \"%s <message>\" in chat to talk to this bot", API.player.Name))
