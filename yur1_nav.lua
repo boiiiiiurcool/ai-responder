@@ -8,19 +8,24 @@
       B.navReset()
 
     HOW IT WORKS (in order, each step only runs if the one before it can't solve it)
+      0. LADDERS     goal more than NAV_VERT_MIN studs above/below us (and not directly reachable):
+                     pick the best TrussPart ladder, walk to its foot, climb, then re-plan on the new floor.
+                     Stairs / ramps are handled by Roblox pathfinding and the grid A* below.
       1. DIRECT      multi-ray body probe (knee / head height, centre + both sides) + ground samples
                      (gaps, cliffs, big drops). Low obstacles you can hop over are detected separately.
-      2. ROOMS       a 360 degree fan scan finds enclosed rooms and their exits (doorways / openings).
+      2. ROOMS       a cheap coarse scan runs first; only when it looks room-like the full 360 degree fan runs.
                      If the goal is inside a room (or we are), the route is forced through a real exit:
                        - dead-end room with ONE exit  -> that exit is the only choice
                        - several exits                -> cheapest exit, exits that failed before are penalised
                      The route becomes "stations": exit -> outside point -> ... -> goal.
+                     Room logic only runs when both ends are on the same floor.
       3. ROBLOX      PathfindingService with several agent radii + alternate targets.
       4. GRID A*     our own raycast A* (budgeted over many frames) when Roblox fails or after being stuck:
                      wall-clearance costs, jump costs, bad-cell memory, partial paths when the goal is walled off.
       5. SMOOTHING   string-pulling with the multi-ray probe so the bot cuts corners instead of zig-zagging.
       6. FOLLOWING   look-ahead along the path, auto-hop over low obstacles, whisker steering around
                      things that appear (doors, props), lane offsets + separation for several bots.
+                     In tight spaces (B.tight) lanes are off and the separation radius is small.
       7. RECOVERY    escalating stuck handling: hop -> side-step -> back-track -> escape through the biggest
                      opening toward the goal -> force grid planner. Stuck spots are remembered as "bad".
 ]]
@@ -35,13 +40,15 @@ return function(B)
 
 	local function def(k, v) if C[k] == nil then C[k] = v end end
 	def("NAV_HIP", 3)            -- root part height above the floor
-	def("NAV_FAN_RAYS", 32)      -- rays in the 360 degree room scan
+	def("NAV_FAN_RAYS", 32)      -- rays in the full 360 degree room scan
+	def("NAV_COARSE_RAYS", 10)   -- rays in the cheap first scan
 	def("NAV_FAN_RANGE", 40)     -- scan distance
 	def("NAV_ROOM_RADIUS", 26)   -- a place counts as "room" when most rays hit a wall closer than this
 	def("NAV_ROOM_CLOSED", 0.7)  -- fraction of rays that must be short for a room
 	def("NAV_OPEN_MIN", 12)      -- a ray must reach at least this far to count as an opening
 	def("NAV_DOOR_MIN", 2.5)     -- opening width limits that count as a doorway
 	def("NAV_DOOR_MAX", 14)
+	def("NAV_VERT_MIN", 7)       -- height difference that triggers a ladder search
 	def("NAV_GRID", 3)           -- A* cell size (studs)
 	def("NAV_GRID_MAX", 1200)    -- max A* node expansions per search
 	def("NAV_GRID_TIME", 4)      -- max seconds per A* search
@@ -68,6 +75,7 @@ return function(B)
 		recoverPoint = nil, recoverUntil = 0, sideDir = 1, forceGridUntil = 0,
 		bad = {}, badCount = 0, doorFail = {}, hist = {}, histAt = 0, failures = 0,
 		wpIdx = nil, wpAt = 0, blockedConn = nil, pathObj = nil, direct = nil,
+		climbing = nil,
 	}
 	local scanCache, scanCount = {}, 0
 
@@ -192,14 +200,38 @@ return function(B)
 		return rays
 	end
 
+	local function cacheScan(ck, res)
+		scanCount += 1
+		if scanCount > 200 then scanCache, scanCount = {}, 0 end
+		scanCache[ck] = res
+		return res
+	end
+
 	-- returns {rays, exits, isRoom, med, closedFrac}; exits = {pos, dir, width, kind, outer, key}
+	-- Two stages: a cheap coarse scan first (open areas stop here: no exits, not a room), and the full
+	-- scan only when the coarse one already looks room-like. fresh = true always does the full scan.
 	local function analyze(origin, fresh)
 		local now = os.clock()
 		local ck = cell2(origin, 4)
 		local c = scanCache[ck]
-		if c and not fresh and now - c.t < 5 then return c end
+		if c and not fresh and now - c.t < 8 then return c end
 
 		local N, R = C.NAV_FAN_RAYS, C.NAV_FAN_RANGE
+
+		if not fresh then
+			local coarse = fan(origin, C.NAV_COARSE_RAYS, R)
+			local short = 0
+			for i = 1, #coarse do
+				if coarse[i].dist < C.NAV_ROOM_RADIUS then short += 1 end
+			end
+			if short / #coarse < C.NAV_ROOM_CLOSED - 0.25 then
+				return cacheScan(ck, {
+					rays = coarse, exits = {}, med = R, t = now, origin = origin,
+					closedFrac = short / #coarse, isRoom = false,
+				})
+			end
+		end
+
 		local rays = fan(origin, N, R)
 		local ds, closedCnt = {}, 0
 		for i = 1, N do
@@ -242,20 +274,16 @@ return function(B)
 			end
 		end
 
-		local res = {
+		return cacheScan(ck, {
 			rays = rays, exits = exits, med = med, t = now, origin = origin,
 			closedFrac = closedCnt / N,
 			isRoom = (closedCnt / N >= C.NAV_ROOM_CLOSED) and med < C.NAV_ROOM_RADIUS,
-		}
-		scanCount += 1
-		if scanCount > 200 then scanCache, scanCount = {}, 0 end
-		scanCache[ck] = res
-		return res
+		})
 	end
 
-	-- is point p inside the line of sight of a scan taken at origin
+	-- is point p inside the line of sight of a scan taken at origin (works for coarse and full scans)
 	local function visible(an, origin, p)
-		local N = C.NAV_FAN_RAYS
+		local N = #an.rays
 		local dx, dz = p.X - origin.X, p.Z - origin.Z
 		local m = math.sqrt(dx * dx + dz * dz)
 		if m < 1 then return true end
@@ -269,11 +297,77 @@ return function(B)
 		return groundBelow(p.X, p.Z, p.Y + 4, 30) or p
 	end
 
+	-- ═══ ladders (vertical routes) ═══════════════════════════════════════════════════════════
+	local trussList, trussAt = {}, -100
+	local function trusses()
+		local now = os.clock()
+		if now - trussAt > 60 then
+			trussAt, trussList = now, {}
+			for _, d in ipairs(workspace:GetDescendants()) do
+				if d:IsA("TrussPart") then trussList[#trussList + 1] = d end
+			end
+		end
+		return trussList
+	end
+
+	-- best ladder for getting from feet to goalFeet when they are on different floors.
+	-- returns a station {pos = foot of the ladder, climb = {truss, exit, out}, key} or nil
+	local function findClimb(feet, goalFeet)
+		local up = goalFeet.Y > feet.Y
+		local best, bs
+		for _, t in ipairs(trusses()) do
+			if t.Parent and t.CanCollide ~= nil then
+				local sz = t.Size
+				if sz.Y >= sz.X and sz.Y >= sz.Z then -- only (roughly) vertical ladders
+					local half = V3(0, sz.Y / 2, 0)
+					local lo = t.Position - half
+					local hi = t.Position + half
+					local enter, exit = lo, hi
+					if not up then enter, exit = hi, lo end
+
+					-- the ladder must actually end near the goal's height
+					local heightErr = math.abs(exit.Y - goalFeet.Y)
+					if heightErr < math.abs(feet.Y - goalFeet.Y) - 3 then
+						local sc = flatDist(feet, enter) + flatDist(exit, goalFeet) + heightErr * 2
+							+ (S.doorFail["t" .. dkey(t.Position)] or 0) * 60
+						if not bs or sc < bs then best, bs = {t = t, enter = enter, exit = exit}, sc end
+					end
+				end
+			end
+		end
+		if not best then return nil end
+
+		-- stand a bit away from the ladder on the side we come from, leave on the side of the goal
+		local tp = best.t.Position
+		local comeDir = V3(feet.X - tp.X, 0, feet.Z - tp.Z)
+		comeDir = comeDir.Magnitude > 0.1 and comeDir.Unit or V3(0, 0, 1)
+		local goDir = V3(goalFeet.X - tp.X, 0, goalFeet.Z - tp.Z)
+		goDir = goDir.Magnitude > 0.1 and goDir.Unit or comeDir
+
+		local footPos = V3(tp.X, best.enter.Y, tp.Z) + comeDir * 2.5
+		local foot = snapOut(footPos + V3(0, 3, 0))
+		local exitPos = V3(tp.X, best.exit.Y, tp.Z) + goDir * 3
+		return {
+			pos = foot, door = false, key = "t" .. dkey(tp),
+			climb = {truss = best.t, exit = exitPos, out = goDir, up = up},
+		}
+	end
+
 	-- route through real exits: leave our room by its best exit, enter the goal's room by its best exit.
 	-- a dead-end room (ONE exit) simply has a single candidate.
+	-- Different floors: a ladder station comes first (rooms are only analysed on the same floor).
 	local function computeStations(feet, goalFeet)
 		local list = {}
 		local cur = feet
+
+		if math.abs(goalFeet.Y - feet.Y) > C.NAV_VERT_MIN then
+			local climb = findClimb(feet, goalFeet)
+			if climb then
+				dbg("ladder route", climb.key)
+				list[1] = climb
+				return list
+			end
+		end
 
 		local aS = analyze(feet)
 		if aS.isRoom and #aS.exits > 0 and not visible(aS, feet, goalFeet) then
@@ -611,7 +705,10 @@ return function(B)
 	end
 
 	-- ═══ moving ══════════════════════════════════════════════════════════════════════════════
+	-- tight spaces (B.tight, set by the main script) use a small separation radius so bots in a doorway
+	-- don't shove each other back out of it
 	local function separation(pos)
+		local sd = B.tight and (C.TIGHT_SEP or 2.5) or C.SEPARATION_DIST
 		local push = V3(0, 0, 0)
 		for _, p in ipairs(Players:GetPlayers()) do
 			if p ~= lp and isBot(p) then
@@ -619,12 +716,12 @@ return function(B)
 				if r then
 					local off = V3(pos.X - r.Position.X, 0, pos.Z - r.Position.Z)
 					local d = off.Magnitude
-					if d < C.SEPARATION_DIST then
+					if d < sd then
 						if d < 0.1 then
 							off = V3(math.random() - 0.5, 0, math.random() - 0.5)
 							d = off.Magnitude + 0.01
 						end
-						push += off.Unit * ((C.SEPARATION_DIST - d) / C.SEPARATION_DIST)
+						push += off.Unit * ((sd - d) / sd)
 					end
 				end
 			end
@@ -736,6 +833,40 @@ return function(B)
 		return ok
 	end
 
+	-- drive up / down a ladder. returns the point to MoveTo, or nil when the climb is over
+	local function climbStep(feet, hum, now)
+		local cl = S.climbing
+		local t = cl.truss
+		if not t.Parent or now - cl.since > 10 then
+			-- ladder gone or climb failed: penalise it and plan something else
+			S.doorFail[cl.key] = (S.doorFail[cl.key] or 0) + 1
+			S.climbing, S.stations = nil, nil
+			invalidate()
+			return nil
+		end
+
+		local reached = math.abs(feet.Y - cl.exit.Y) < 2.5
+		if reached then
+			-- off the ladder: step out toward the goal side, then re-plan on the new floor
+			if cl.topAt == math.huge then cl.topAt = now end
+			if now - cl.topAt > 0.4 then
+				S.climbing, S.stations = nil, nil
+				invalidate()
+				S.recoverPoint, S.recoverUntil = nil, 0
+			end
+			return cl.exit + V3(0, C.NAV_HIP, 0)
+		end
+		cl.topAt = math.huge
+
+		-- keep pushing into the ladder at the height we want to reach
+		local tp = t.Position
+		local targetY = cl.up and math.max(cl.exit.Y, feet.Y + 6) or math.min(cl.exit.Y, feet.Y - 6)
+		if flatDist(feet, tp) > 3.5 then
+			return V3(tp.X, feet.Y + C.NAV_HIP, tp.Z) -- walk up to the ladder first
+		end
+		return V3(tp.X, targetY + C.NAV_HIP, tp.Z)
+	end
+
 	-- ═══ the step the main script calls ══════════════════════════════════════════════════════
 	-- returns the point to MoveTo, and true when the way to the goal is a clean straight line
 	local function step(goalRoot, dt, alt)
@@ -752,6 +883,13 @@ return function(B)
 			S.stuck, S.lastPos, S.recoverPoint = 0, nil, nil
 		end
 		S.lastStepAt = now
+
+		-- on a ladder: nothing else matters until the climb is done
+		if S.climbing then
+			S.stuck, S.lastPos = 0, nil
+			local p = climbStep(feet, hum, now)
+			if p then return p, false end
+		end
 
 		if now - S.histAt > 0.5 then
 			S.histAt = now
@@ -778,14 +916,28 @@ return function(B)
 			return S.recoverPoint, false
 		end
 
-		-- door station bookkeeping
+		-- station bookkeeping (doors and ladders)
 		local st = S.stations and S.stations[S.stIdx]
 		if st then
 			if flatDist(feet, st.pos) < 2.6 and math.abs(feet.Y - st.pos.Y) < 6 then
-				S.stIdx += 1
-				S.stSince = now
-				invalidate()
-				st = S.stations[S.stIdx]
+				if st.climb then
+					-- at the foot of the ladder: start climbing
+					S.climbing = {
+						truss = st.climb.truss, exit = st.climb.exit, up = st.climb.up,
+						key = st.key, since = now, topAt = math.huge,
+					}
+					S.stIdx += 1
+					S.stSince = now
+					invalidate()
+					local p = climbStep(feet, hum, now)
+					if p then return p, false end
+					st = S.stations and S.stations[S.stIdx]
+				else
+					S.stIdx += 1
+					S.stSince = now
+					invalidate()
+					st = S.stations[S.stIdx]
+				end
 			elseif now - S.stSince > C.NAV_STATION_TIME then
 				failStation(st)
 				invalidate()
@@ -832,8 +984,13 @@ return function(B)
 			S.path = nil
 			S.retryAt = now + 0.3
 			if st then
-				S.stIdx += 1
-				S.stSince = now
+				if st.climb then
+					-- reached the ladder foot through the path end: the bookkeeping above starts the climb next step
+					S.retryAt = now
+				else
+					S.stIdx += 1
+					S.stSince = now
+				end
 			end
 			return applySep(rootPos, goalRoot, goalRoot), false
 		end
@@ -864,13 +1021,14 @@ return function(B)
 		if p[S.idx].jump and flatDist(feet, p[S.idx].pos) < 6 then jump(hum) end
 		local point = wp.pos
 
-		-- lanes for several bots (not inside doorways)
-		if B.botCount > 1 and pick < #p and not wp.jump and not (st and st.door) then
+		-- lanes for several bots (not inside doorways / tight spaces). Uses the fair slot from the main script.
+		if B.botCount > 1 and not B.tight and pick < #p and not wp.jump and not (st and st.door) then
 			local dir = V3(point.X - feet.X, 0, point.Z - feet.Z)
 			if dir.Magnitude > 1 then
 				dir = dir.Unit
 				local right = V3(-dir.Z, 0, dir.X)
-				local lane = math.clamp((B.mySlot - (B.botCount + 1) / 2) * C.LANE_WIDTH, -10, 10)
+				local slot = B.slotNow and B.slotNow() or B.mySlot
+				local lane = math.clamp((slot - (B.botCount + 1) / 2) * C.LANE_WIDTH, -10, 10)
 				local cand = point + right * lane
 				if wallStatus(feet, cand, 1.0) == 0 then point = cand end
 			end
@@ -890,7 +1048,7 @@ return function(B)
 	B.analyze = function(p) return analyze(p - HIPV) end
 	B.navReset = function()
 		invalidate()
-		S.stations, S.stuck, S.stuckLevel = nil, 0, 0
+		S.stations, S.stuck, S.stuckLevel, S.climbing = nil, 0, 0, nil
 	end
 
 	table.insert(B.restores, function()
@@ -899,5 +1057,5 @@ return function(B)
 		B.navStep, B.lineClear, B.analyze, B.navReset = nil, nil, nil, nil
 	end)
 
-	print("[yur1] nav module active (rooms, exits, multi-ray probes, grid A*)")
+	print("[yur1] nav module active (rooms, exits, ladders, multi-ray probes, grid A*)")
 end
