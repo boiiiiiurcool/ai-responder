@@ -1,5 +1,9 @@
 -- yur1_menu.lua  (owner menu: Accounts tab + Settings tab)
 -- Loaded by yur1.lua. Called as  menu = ctor(U)  and returns { root = Frame, refresh = function(data) }
+--
+-- Settings tab:  Chat / Kill lines / Dancing / AI chat switches
+--                Hide key  (click it, then press the combo you want: Ctrl / Shift / Alt / Win + a key, Esc = cancel)
+--                Unload    (click twice to confirm)
 
 return function(U)
 	local Players = game:GetService("Players")
@@ -479,11 +483,77 @@ return function(U)
 	makeSwitch(92,  "Dancing",    "Alts dance when the protected player idles", "dance")
 	makeSwitch(138, "AI chat",    "Alts answer when their name is said",        "ai")
 
+	-- Hide key: click the button, then press the combo (Ctrl / Shift / Alt / Win + a key). Esc cancels.
+	local hotkeyBtn = nil
+	if U.hotkey then
+		local row = Instance.new("Frame")
+		row.Position = UDim2.fromOffset(0, 184)
+		row.Size = UDim2.new(1, 0, 0, 40)
+		row.BackgroundColor3 = PANEL_COLOR
+		row.BorderSizePixel = 0
+		row.Parent = settingsPage
+		addCorner(row, 6)
+
+		local titleLabel = Instance.new("TextLabel")
+		titleLabel.BackgroundTransparency = 1
+		titleLabel.Position = UDim2.fromOffset(12, 5)
+		titleLabel.Size = UDim2.new(1, -160, 0, 16)
+		titleLabel.Font = Enum.Font.GothamMedium
+		titleLabel.Text = "Hide key"
+		titleLabel.TextColor3 = TEXT_COLOR
+		titleLabel.TextSize = 13
+		titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+		titleLabel.Parent = row
+
+		local descLabel = Instance.new("TextLabel")
+		descLabel.BackgroundTransparency = 1
+		descLabel.Position = UDim2.fromOffset(12, 22)
+		descLabel.Size = UDim2.new(1, -160, 0, 14)
+		descLabel.Font = Enum.Font.Gotham
+		descLabel.Text = "Click, then press the keys  (Esc = cancel)"
+		descLabel.TextColor3 = DIM_TEXT
+		descLabel.TextSize = 11
+		descLabel.TextXAlignment = Enum.TextXAlignment.Left
+		descLabel.Parent = row
+
+		hotkeyBtn = smallButton(row, U.hotkey.describe(), UDim2.new(1, -142, 0.5, -12), UDim2.fromOffset(130, 24))
+		hotkeyBtn.TextSize = 12
+		hotkeyBtn.Activated:Connect(function()
+			if U.hotkey.isCapturing() then
+				U.hotkey.cancelCapture()
+				hotkeyBtn.Text = U.hotkey.describe()
+				return
+			end
+			hotkeyBtn.Text = "Press keys..."
+			U.hotkey.capture(function()
+				if hotkeyBtn.Parent then hotkeyBtn.Text = U.hotkey.describe() end
+			end)
+		end)
+	end
+
+	-- Unload: click twice (the second click within 3 seconds confirms)
+	if U.unload then
+		local unloadBtn = smallButton(settingsPage, "Unload", UDim2.fromOffset(0, 232), UDim2.new(1, 0, 0, 30))
+		local armedAt = 0
+		unloadBtn.Activated:Connect(function()
+			if os.clock() - armedAt < 3 then
+				U.unload()
+				return
+			end
+			armedAt = os.clock()
+			unloadBtn.Text = "Click again to unload"
+			task.delay(3, function()
+				if unloadBtn.Parent and os.clock() - armedAt >= 3 then unloadBtn.Text = "Unload" end
+			end)
+		end)
+	end
+
 	function m.refresh(data)
 		lastData = data
 		refreshList(data)
 		refreshSub()
 		for key, set in pairs(switches) do set(control.settings[key], false) end
+		if hotkeyBtn and not U.hotkey.isCapturing() then hotkeyBtn.Text = U.hotkey.describe() end
 	end
 
 	showTab("accounts")
