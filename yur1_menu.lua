@@ -108,9 +108,16 @@ return function(U)
 	subLabel.Text = ""
 	subLabel.Parent = accountsPage
 
+	-- typing bar + Set live in a group so they can fade away while a sub owner is set
+	local subInput = Instance.new("CanvasGroup")
+	subInput.Position = UDim2.fromOffset(0, 22)
+	subInput.Size = UDim2.new(1, 0, 0, 30)
+	subInput.BackgroundTransparency = 1
+	subInput.Parent = accountsPage
+
 	local subBox = Instance.new("TextBox")
-	subBox.Position = UDim2.fromOffset(0, 22)
-	subBox.Size = UDim2.new(1, -180, 0, 30)
+	subBox.Position = UDim2.fromOffset(0, 0)
+	subBox.Size = UDim2.new(1, -90, 1, 0)
 	subBox.BackgroundColor3 = PANEL_COLOR
 	subBox.Font = Enum.Font.Gotham
 	subBox.PlaceholderText = "sub owner username"
@@ -120,15 +127,14 @@ return function(U)
 	subBox.TextSize = 13
 	subBox.TextXAlignment = Enum.TextXAlignment.Left
 	subBox.ClearTextOnFocus = false
-	subBox.Parent = accountsPage
+	subBox.Parent = subInput
 	addCorner(subBox, 6)
 	addStroke(subBox, 0.5)
 	local subPad = Instance.new("UIPadding")
 	subPad.PaddingLeft = UDim.new(0, 10)
 	subPad.Parent = subBox
 
-	local setBtn = smallButton(accountsPage, "Set", UDim2.new(1, -170, 0, 22), UDim2.fromOffset(80, 30))
-	local removeBtn = smallButton(accountsPage, "Remove", UDim2.new(1, -84, 0, 22), UDim2.fromOffset(84, 30))
+	local setBtn = smallButton(subInput, "Set", UDim2.new(1, -80, 0, 0), UDim2.new(0, 80, 1, 0))
 
 	local altList = Instance.new("ScrollingFrame")
 	altList.Position = UDim2.fromOffset(0, 62)
@@ -169,11 +175,72 @@ return function(U)
 		end
 	end
 
+	-- spectate the sub owner (button toggles)
+	local spectating = false
+
+	local function stopSpectate()
+		spectating = false
+		local cam = workspace.CurrentCamera
+		local myHum = player.Character and player.Character:FindFirstChildOfClass("Humanoid")
+		if cam and myHum then cam.CameraSubject = myHum end
+	end
+
+	local function subHumanoid()
+		local p = control.subOwner ~= "" and findServerPlayer(control.subOwner) or nil
+		return p and p.Character and p.Character:FindFirstChildOfClass("Humanoid")
+	end
+
+	local function setSpectate(on)
+		if not on then return stopSpectate() end
+		local hum, cam = subHumanoid(), workspace.CurrentCamera
+		if not (hum and cam) then return end
+		cam.CameraSubject = hum
+		spectating = true
+	end
+
+	task.spawn(function()
+		while U.isAlive() do
+			task.wait(0.5)
+			if spectating then
+				if control.subOwner == "" or not findServerPlayer(control.subOwner) then
+					stopSpectate()
+					if lastData then m.refresh(lastData) end
+				else
+					local hum, cam = subHumanoid(), workspace.CurrentCamera
+					if hum and cam and cam.CameraSubject ~= hum then cam.CameraSubject = hum end
+				end
+			end
+		end
+		if spectating then stopSpectate() end
+	end)
+
+	-- typing bar + Set fade away while a sub owner is set (the list slides up), and come back when removed
+	local FADE = TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+	local inputShown, fadeToken = true, 0
+
+	local function setInputShown(show)
+		if show == inputShown then return end
+		inputShown = show
+		fadeToken += 1
+		local token = fadeToken
+		if show then subInput.Visible = true end
+		TweenService:Create(subInput, FADE, { GroupTransparency = show and 0 or 1 }):Play()
+		TweenService:Create(altList, FADE, {
+			Position = show and UDim2.fromOffset(0, 62) or UDim2.fromOffset(0, 0),
+			Size = show and UDim2.new(1, 0, 0, 172) or UDim2.new(1, 0, 0, 234),
+		}):Play()
+		if not show then
+			task.delay(0.32, function()
+				if token == fadeToken then subInput.Visible = false end
+			end)
+		end
+	end
+
 	local function refreshSub()
-		if control.subOwner ~= "" then
-			local here = findServerPlayer(control.subOwner)
-			subLabel.Text = "Sub owner: " .. control.subOwner .. (here and "" or "  (not in this server)")
-			subLabel.TextColor3 = TEXT_COLOR
+		local has = control.subOwner ~= ""
+		setInputShown(not has)
+		if has then
+			subLabel.Text = ""
 		else
 			subLabel.Text = "Sub owner: none  (alts protect " .. player.Name .. ")"
 			subLabel.TextColor3 = DIM_TEXT
@@ -198,19 +265,14 @@ return function(U)
 				return
 			end
 		end
-		control.subOwner = txt -- only 1 at a time: this replaces the old one
+		control.subOwner = txt -- only 1 at a time
 		subBox.Text = ""
 		pushControl()
-		refreshSub()
+		if lastData then m.refresh(lastData) else refreshSub() end
 	end
 
 	setBtn.Activated:Connect(trySetSub)
 	subBox.FocusLost:Connect(function(enter) if enter then trySetSub() end end)
-	removeBtn.Activated:Connect(function()
-		control.subOwner = ""
-		pushControl()
-		refreshSub()
-	end)
 
 	local function refreshList(data)
 		local alts, parts = {}, {}
@@ -225,7 +287,10 @@ return function(U)
 		end
 		currentAlts = alts
 		summary.Text = runningCount .. " / " .. #alts .. " running"
-		emptyLabel.Visible = (#alts == 0)
+		local hasSub = control.subOwner ~= ""
+		local subHere = hasSub and findServerPlayer(control.subOwner) ~= nil
+		emptyLabel.Visible = (#alts == 0 and not hasSub)
+		table.insert(parts, "sub:" .. control.subOwner .. ":" .. tostring(subHere) .. ":" .. tostring(spectating))
 
 		local sig = table.concat(parts, "|")
 		if sig == lastRowSig then return end
@@ -233,6 +298,46 @@ return function(U)
 
 		for _, child in ipairs(altList:GetChildren()) do
 			if child:IsA("Frame") then child:Destroy() end
+		end
+
+		if hasSub then
+			local row = Instance.new("Frame")
+			row.LayoutOrder = 0 -- always on top of the bots
+			row.Size = UDim2.new(1, -6, 0, 32)
+			row.BackgroundColor3 = PANEL_COLOR
+			row.BorderSizePixel = 0
+			row.Parent = altList
+			addCorner(row, 6)
+			addStroke(row, 0.2)
+
+			local nameLabel = Instance.new("TextLabel")
+			nameLabel.BackgroundTransparency = 1
+			nameLabel.Position = UDim2.fromOffset(12, 0)
+			nameLabel.Size = UDim2.new(1, -166, 1, 0)
+			nameLabel.Font = Enum.Font.GothamMedium
+			nameLabel.Text = control.subOwner .. "  -  sub owner" .. (subHere and "" or "  (not here)")
+			nameLabel.TextColor3 = TEXT_COLOR
+			nameLabel.TextSize = 13
+			nameLabel.TextXAlignment = Enum.TextXAlignment.Left
+			nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+			nameLabel.Parent = row
+
+			local specBtn = smallButton(row, spectating and "Unspectate" or "Spectate",
+				UDim2.new(1, -150, 0.5, -12), UDim2.fromOffset(84, 24))
+			specBtn.TextSize = 12
+			specBtn.Activated:Connect(function()
+				setSpectate(not spectating)
+				if lastData then m.refresh(lastData) end
+			end)
+
+			local subRemove = smallButton(row, "Remove", UDim2.new(1, -62, 0.5, -12), UDim2.fromOffset(54, 24))
+			subRemove.TextSize = 12
+			subRemove.Activated:Connect(function()
+				if spectating then stopSpectate() end
+				control.subOwner = ""
+				pushControl()
+				if lastData then m.refresh(lastData) end
+			end)
 		end
 
 		for i, a in ipairs(alts) do
