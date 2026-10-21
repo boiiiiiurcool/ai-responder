@@ -282,17 +282,17 @@ return function(U)
 
 	-- profile block
 	local bigAvatar = Instance.new("ImageLabel")
-	bigAvatar.Position = UDim2.fromOffset(12, 86)
-	bigAvatar.Size = UDim2.fromOffset(44, 44)
+	bigAvatar.Position = UDim2.fromOffset(12, 84)
+	bigAvatar.Size = UDim2.fromOffset(38, 38)
 	bigAvatar.BackgroundColor3 = BG_COLOR
 	bigAvatar.BorderSizePixel = 0
 	bigAvatar.Parent = panel
-	addCorner(bigAvatar, 22)
+	addCorner(bigAvatar, 19)
 
 	local nameText = Instance.new("TextLabel")
 	nameText.BackgroundTransparency = 1
-	nameText.Position = UDim2.fromOffset(64, 88)
-	nameText.Size = UDim2.new(1, -72, 0, 18)
+	nameText.Position = UDim2.fromOffset(58, 85)
+	nameText.Size = UDim2.new(1, -66, 0, 18)
 	nameText.Font = Enum.Font.GothamMedium
 	nameText.Text = ""
 	nameText.TextColor3 = TEXT_COLOR
@@ -303,8 +303,8 @@ return function(U)
 
 	local subText = Instance.new("TextLabel")
 	subText.BackgroundTransparency = 1
-	subText.Position = UDim2.fromOffset(64, 108)
-	subText.Size = UDim2.new(1, -72, 0, 16)
+	subText.Position = UDim2.fromOffset(58, 103)
+	subText.Size = UDim2.new(1, -66, 0, 16)
 	subText.Font = Enum.Font.Gotham
 	subText.Text = ""
 	subText.TextColor3 = DIM_TEXT
@@ -313,10 +313,17 @@ return function(U)
 	subText.TextTruncate = Enum.TextTruncate.AtEnd
 	subText.Parent = panel
 
-	local stats = Instance.new("Frame")
-	stats.Position = UDim2.fromOffset(8, 140)
-	stats.Size = UDim2.new(1, -16, 1, -148)
+	-- scrolls when the window is too short for every row
+	local stats = Instance.new("ScrollingFrame")
+	stats.Position = UDim2.fromOffset(8, 128)
+	stats.Size = UDim2.new(1, -16, 1, -134)
 	stats.BackgroundTransparency = 1
+	stats.BorderSizePixel = 0
+	stats.ScrollBarThickness = 3
+	stats.ScrollBarImageColor3 = OUTLINE_COLOR
+	stats.ScrollingDirection = Enum.ScrollingDirection.Y
+	stats.CanvasSize = UDim2.new()
+	stats.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	stats.Parent = panel
 
 	local statLayout = Instance.new("UIListLayout")
@@ -329,7 +336,7 @@ return function(U)
 		statOrder += 1
 		local row = Instance.new("Frame")
 		row.LayoutOrder = statOrder
-		row.Size = UDim2.new(1, 0, 0, tall and 40 or 22)
+		row.Size = UDim2.new(1, -6, 0, tall and 40 or 22)
 		row.BackgroundColor3 = BG_COLOR
 		row.BorderSizePixel = 0
 		row.Parent = stats
@@ -369,11 +376,11 @@ return function(U)
 
 	local doingV   = makeStat("Doing", true)
 	local distV    = makeStat("Distance from you")
-	local subDistV = makeStat("From sub owner")
 	local healthV  = makeStat("Health")
 	local armorV   = makeStat("Armor")
 	local holdV    = makeStat("Holding")
 	local speedV   = makeStat("Speed")
+	local subDistV = makeStat("From sub owner")
 
 	local function bodyEffect(p, valueName)
 		local folder = workspace:FindFirstChild("Players")
