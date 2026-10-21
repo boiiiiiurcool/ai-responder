@@ -19,6 +19,8 @@ return function(U)
 	local SWITCH_ON, SWITCH_OFF, QUICK_INFO = T.SWITCH_ON, T.SWITCH_OFF, T.QUICK_INFO
 
 	local m = {}
+	control.whitelist = control.whitelist or {}
+	control.blacklist = control.blacklist or {}
 	local lastData = nil
 	local lastRowSig = nil
 
@@ -48,6 +50,7 @@ return function(U)
 
 	local accountsTab, accountsTabStroke = makeTab("Accounts", 16)
 	local settingsTab, settingsTabStroke = makeTab("Settings", 118)
+	local listsTab, listsTabStroke = makeTab("Lists", 220)
 
 	-- "x / y running" sits left of the Sign out button
 	local summary = Instance.new("TextLabel")
@@ -70,21 +73,36 @@ return function(U)
 		return p
 	end
 	local accountsPage = makePage()
-	local settingsPage = makePage()
+	-- the settings page scrolls (more switches than fit in the window)
+	local settingsPage = Instance.new("ScrollingFrame")
+	settingsPage.Position = UDim2.fromOffset(16, 52)
+	settingsPage.Size = UDim2.new(1, -32, 1, -68)
+	settingsPage.BackgroundTransparency = 1
+	settingsPage.BorderSizePixel = 0
+	settingsPage.ScrollBarThickness = 3
+	settingsPage.ScrollBarImageColor3 = OUTLINE_COLOR
+	settingsPage.CanvasSize = UDim2.new()
+	settingsPage.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	settingsPage.Parent = root
+	local listsPage = makePage()
 
 	local function showTab(name)
-		local onAccounts = (name == "accounts")
-		accountsPage.Visible = onAccounts
-		settingsPage.Visible = not onAccounts
-		accountsTab.BackgroundTransparency = onAccounts and 0 or 1
-		accountsTab.TextColor3 = onAccounts and TEXT_COLOR or DIM_TEXT
-		accountsTabStroke.Transparency = onAccounts and 0.3 or 1
-		settingsTab.BackgroundTransparency = onAccounts and 1 or 0
-		settingsTab.TextColor3 = onAccounts and DIM_TEXT or TEXT_COLOR
-		settingsTabStroke.Transparency = onAccounts and 1 or 0.3
+		local tabs = {
+			accounts = {accountsTab, accountsTabStroke, accountsPage},
+			settings = {settingsTab, settingsTabStroke, settingsPage},
+			lists = {listsTab, listsTabStroke, listsPage},
+		}
+		for key, t in pairs(tabs) do
+			local on = (key == name)
+			t[3].Visible = on
+			t[1].BackgroundTransparency = on and 0 or 1
+			t[1].TextColor3 = on and TEXT_COLOR or DIM_TEXT
+			t[2].Transparency = on and 0.3 or 1
+		end
 	end
 	accountsTab.Activated:Connect(function() showTab("accounts") end)
 	settingsTab.Activated:Connect(function() showTab("settings") end)
+	listsTab.Activated:Connect(function() showTab("lists") end)
 
 	local function smallButton(parent, text, pos, size)
 		local b = Instance.new("TextButton")
@@ -398,6 +416,7 @@ return function(U)
 		local extra = open and SIDE_EXTRA or 0
 		accountsPage.Size = UDim2.new(1, -32 - extra, 1, -68)
 		settingsPage.Size = UDim2.new(1, -32 - extra, 1, -68)
+		listsPage.Size = UDim2.new(1, -32 - extra, 1, -68)
 		if U.setSideWidth then U.setSideWidth(open and SIDE_EXTRA or 0) end
 	end
 
@@ -855,12 +874,13 @@ return function(U)
 	makeSwitch(46,  "Kill lines", "One alt types a line after a kill",          "kill")
 	makeSwitch(92,  "Dancing",    "Alts dance when the protected player idles", "dance")
 	makeSwitch(138, "AI chat",    "Alts answer when their name is said",        "ai")
+	makeSwitch(184, "Carry mode", "A bot carries you to the armor shop when knocked", "carry")
 
 	-- Hide key: click the button, then press the combo (Ctrl / Shift / Alt / Win + a key). Esc cancels.
 	local hotkeyBtn = nil
 	if U.hotkey then
 		local row = Instance.new("Frame")
-		row.Position = UDim2.fromOffset(0, 184)
+		row.Position = UDim2.fromOffset(0, 230)
 		row.Size = UDim2.new(1, 0, 0, 40)
 		row.BackgroundColor3 = PANEL_COLOR
 		row.BorderSizePixel = 0
@@ -906,7 +926,7 @@ return function(U)
 
 	-- Unload: click twice (the second click within 3 seconds confirms)
 	if U.unload then
-		local unloadBtn = smallButton(settingsPage, "Unload", UDim2.fromOffset(0, 232), UDim2.new(1, 0, 0, 30))
+		local unloadBtn = smallButton(settingsPage, "Unload", UDim2.fromOffset(0, 278), UDim2.new(1, 0, 0, 30))
 		local armedAt = 0
 		unloadBtn.Activated:Connect(function()
 			if os.clock() - armedAt < 3 then
@@ -921,7 +941,150 @@ return function(U)
 		end)
 	end
 
+	---------------------------------------------------------------- Lists page (whitelist / blacklist)
+	-- whitelist: the bots never target these players. blacklist: the bots go after them on sight.
+	-- A name lives in one list only (adding it to one removes it from the other).
+	local listCols = {}
+
+	local function makeListColumn(xScale, xOff, title, desc, key, otherKey)
+		local col = Instance.new("Frame")
+		col.Position = UDim2.new(xScale, xOff, 0, 0)
+		col.Size = UDim2.new(0.5, -6, 1, 0)
+		col.BackgroundTransparency = 1
+		col.Parent = listsPage
+
+		local t = Instance.new("TextLabel")
+		t.BackgroundTransparency = 1
+		t.Size = UDim2.new(1, 0, 0, 16)
+		t.Font = Enum.Font.GothamMedium
+		t.Text = title
+		t.TextColor3 = TEXT_COLOR
+		t.TextSize = 13
+		t.TextXAlignment = Enum.TextXAlignment.Left
+		t.Parent = col
+
+		local d = Instance.new("TextLabel")
+		d.BackgroundTransparency = 1
+		d.Position = UDim2.fromOffset(0, 17)
+		d.Size = UDim2.new(1, 0, 0, 14)
+		d.Font = Enum.Font.Gotham
+		d.Text = desc
+		d.TextColor3 = DIM_TEXT
+		d.TextSize = 11
+		d.TextXAlignment = Enum.TextXAlignment.Left
+		d.Parent = col
+
+		local box = Instance.new("TextBox")
+		box.Position = UDim2.fromOffset(0, 38)
+		box.Size = UDim2.new(1, -64, 0, 28)
+		box.BackgroundColor3 = PANEL_COLOR
+		box.Font = Enum.Font.Gotham
+		box.PlaceholderText = "username"
+		box.PlaceholderColor3 = DIM_TEXT
+		box.Text = ""
+		box.TextColor3 = TEXT_COLOR
+		box.TextSize = 13
+		box.TextXAlignment = Enum.TextXAlignment.Left
+		box.ClearTextOnFocus = false
+		box.Parent = col
+		addCorner(box, 6)
+		addStroke(box, 0.5)
+		local pad = Instance.new("UIPadding")
+		pad.PaddingLeft = UDim.new(0, 8)
+		pad.Parent = box
+
+		local addBtn = smallButton(col, "Add", UDim2.new(1, -58, 0, 38), UDim2.fromOffset(58, 28))
+
+		local scroller = Instance.new("ScrollingFrame")
+		scroller.Position = UDim2.fromOffset(0, 74)
+		scroller.Size = UDim2.new(1, 0, 1, -74)
+		scroller.BackgroundTransparency = 1
+		scroller.BorderSizePixel = 0
+		scroller.ScrollBarThickness = 3
+		scroller.ScrollBarImageColor3 = OUTLINE_COLOR
+		scroller.CanvasSize = UDim2.new()
+		scroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+		scroller.Parent = col
+		local layout = Instance.new("UIListLayout")
+		layout.Padding = UDim.new(0, 4)
+		layout.SortOrder = Enum.SortOrder.LayoutOrder
+		layout.Parent = scroller
+		local spad = Instance.new("UIPadding")
+		spad.PaddingLeft = UDim.new(0, 2)
+		spad.PaddingTop = UDim.new(0, 2)
+		spad.Parent = scroller
+
+		local lastSig = nil
+		local function rebuild()
+			local sig = table.concat(control[key], "|")
+			if sig == lastSig then return end
+			lastSig = sig
+			for _, c in ipairs(scroller:GetChildren()) do
+				if c:IsA("Frame") then c:Destroy() end
+			end
+			for i, name in ipairs(control[key]) do
+				local row = Instance.new("Frame")
+				row.LayoutOrder = i
+				row.Size = UDim2.new(1, -8, 0, 26)
+				row.BackgroundColor3 = PANEL_COLOR
+				row.BorderSizePixel = 0
+				row.Parent = scroller
+				addCorner(row, 6)
+
+				local nl = Instance.new("TextLabel")
+				nl.BackgroundTransparency = 1
+				nl.Position = UDim2.fromOffset(8, 0)
+				nl.Size = UDim2.new(1, -40, 1, 0)
+				nl.Font = Enum.Font.Gotham
+				nl.Text = name
+				nl.TextColor3 = TEXT_COLOR
+				nl.TextSize = 12
+				nl.TextXAlignment = Enum.TextXAlignment.Left
+				nl.TextTruncate = Enum.TextTruncate.AtEnd
+				nl.Parent = row
+
+				local rm = smallButton(row, "X", UDim2.new(1, -30, 0.5, -10), UDim2.fromOffset(24, 20))
+				rm.TextSize = 11
+				rm.Activated:Connect(function()
+					for j, n in ipairs(control[key]) do
+						if n == name then table.remove(control[key], j); break end
+					end
+					pushControl()
+					for _, c in pairs(listCols) do c.rebuild() end
+				end)
+			end
+		end
+
+		local function add()
+			local txt = (string.gsub(box.Text, "[%s@]", ""))
+			if txt == "" then return end
+			local here = findServerPlayer(txt)
+			if here then txt = here.Name end
+			local l = string.lower(txt)
+			box.Text = ""
+			for _, n in ipairs(control[key]) do
+				if string.lower(n) == l then return end
+			end
+			for j, n in ipairs(control[otherKey]) do -- a name is only in one list
+				if string.lower(n) == l then table.remove(control[otherKey], j); break end
+			end
+			table.insert(control[key], txt)
+			pushControl()
+			for _, c in pairs(listCols) do c.rebuild() end
+		end
+
+		addBtn.Activated:Connect(add)
+		box.FocusLost:Connect(function(enter) if enter then add() end end)
+
+		listCols[key] = { rebuild = rebuild }
+		rebuild()
+	end
+
+	makeListColumn(0, 0, "Whitelist", "Never targeted", "whitelist", "blacklist")
+	makeListColumn(0.5, 6, "Blacklist", "Always targeted on sight", "blacklist", "whitelist")
+
 	function m.refresh(data)
+		for _, c in pairs(listCols) do c.rebuild() end
 		lastData = data
 		refreshList(data)
 		refreshSub()
