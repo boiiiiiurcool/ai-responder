@@ -1,6 +1,7 @@
 -- yur1_menu.lua  (owner menu: Accounts tab + Settings tab)
 -- Loaded by yur1.lua. Called as  menu = ctor(U)  and returns { root = Frame, refresh = function(data) }
 --
+-- Top right:     "x / y running" counter + Sign out (click twice: everybody goes back to the Owner / Alt screen)
 -- Settings tab:  Chat / Kill lines / Dancing / AI chat switches
 --                Hide key  (click it, then press the combo you want: Ctrl / Shift / Alt / Win + a key, Esc = cancel)
 --                Unload    (click twice to confirm)
@@ -48,9 +49,10 @@ return function(U)
 	local accountsTab, accountsTabStroke = makeTab("Accounts", 16)
 	local settingsTab, settingsTabStroke = makeTab("Settings", 118)
 
+	-- "x / y running" sits left of the Sign out button
 	local summary = Instance.new("TextLabel")
 	summary.BackgroundTransparency = 1
-	summary.Position = UDim2.new(1, -136, 0, 12)
+	summary.Position = UDim2.new(1, -240, 0, 12)
 	summary.Size = UDim2.fromOffset(120, 26)
 	summary.Font = Enum.Font.Gotham
 	summary.Text = ""
@@ -98,6 +100,26 @@ return function(U)
 		addCorner(b, 6)
 		attachHover(b, addStroke(b, 0.5))
 		return b
+	end
+
+	-- Sign out: click twice (the second click within 3 seconds confirms). Every account goes back to the
+	-- Owner / Alt screen, this one included.
+	if U.signOut then
+		local soBtn = smallButton(root, "Sign out", UDim2.new(1, -112, 0, 12), UDim2.fromOffset(96, 26))
+		soBtn.TextSize = 12
+		local armedAt = 0
+		soBtn.Activated:Connect(function()
+			if os.clock() - armedAt < 3 then
+				armedAt = 0
+				U.signOut()
+				return
+			end
+			armedAt = os.clock()
+			soBtn.Text = "Click again"
+			task.delay(3, function()
+				if soBtn.Parent and os.clock() - armedAt >= 3 then soBtn.Text = "Sign out" end
+			end)
+		end)
 	end
 
 	---------------------------------------------------------------- Accounts page
@@ -203,7 +225,8 @@ return function(U)
 	end
 
 	task.spawn(function()
-		while U.isAlive() do
+		-- also ends when this menu is destroyed (sign out)
+		while U.isAlive() and root.Parent do
 			task.wait(0.5)
 			if spectating then
 				if control.subOwner == "" or not findServerPlayer(control.subOwner) then
