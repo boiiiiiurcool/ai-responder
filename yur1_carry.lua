@@ -7,10 +7,9 @@
 --          allows only C.CARRY_CHASERS bots to chase, so the others watch for incoming attacks)
 --   * 0.6s after the knock-out the bot that is CLOSEST to the owner becomes the carrier (ties: name order).
 --     The choice is locked until the owner is up again.
---   * The carrier: runs to the owner > triggers the game's carry action > walks to the nearest armor shop >
---     triggers the carry action again (drop) next to the shop.  The owner buys / heals there.
---   * Carry action = a ProximityPrompt / ClickDetector on the owner whose text matches C.CARRY_WORDS,
---     otherwise the key C.CARRY_KEY. CHECK THIS IN YOUR GAME - turn on Config.Debug-like prints below.
+--   * The carrier: runs to the owner's HEAD > presses G (carry) > walks to the nearest armor shop >
+--     presses G again (drop) next to the shop.  The owner buys / heals there.
+--   * The key is C.CARRY_KEY (default "G").
 
 return function(B)
 	local C, lp = B.C, B.lp
@@ -65,42 +64,28 @@ return function(B)
 	end
 
 	-- ─── the carry action (grab / drop use the same trigger) ──────────────────────────────────
-	local function matches(text)
-		text = string.lower(text or "")
-		for _, w in ipairs(C.CARRY_WORDS) do
-			if string.find(text, w, 1, true) then return true end
-		end
-		return false
-	end
-
 	local function pressKey(name)
 		local VIM = B.VIM
 		local ok, kc = pcall(function() return Enum.KeyCode[name] end)
 		if not (VIM and ok and kc) then return false end
 		pcall(function()
 			VIM:SendKeyEvent(true, kc, false, game)
-			task.wait(0.06)
+			task.wait(0.08)
 			VIM:SendKeyEvent(false, kc, false, game)
 		end)
 		return true
 	end
 
-	local function carryAction(ownerChar)
-		if ownerChar then
-			for _, d in ipairs(ownerChar:GetDescendants()) do
-				if d:IsA("ProximityPrompt") and matches((d.ActionText or "") .. " " .. (d.ObjectText or "") .. " " .. d.Name) then
-					if fireproximityprompt then
-						pcall(fireproximityprompt, d)
-						return "prompt '" .. tostring(d.ActionText) .. "'"
-					end
-				elseif d:IsA("ClickDetector") and matches(d.Name) and fireclickdetector then
-					pcall(fireclickdetector, d)
-					return "click detector '" .. d.Name .. "'"
-				end
-			end
-		end
+	-- grab and drop are the same key (G): first press carries, second press drops
+	local function carryAction()
 		if pressKey(C.CARRY_KEY) then return "key " .. tostring(C.CARRY_KEY) end
 		return nil
+	end
+
+	-- the owner's head (falls back to the root part) - the carrier walks to this
+	local function headOf(plr)
+		local char = plr and plr.Character
+		return char and (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart"))
 	end
 
 	-- ─── armor shops ──────────────────────────────────────────────────────────────────────────
@@ -140,22 +125,28 @@ return function(B)
 			local started, near = os.clock(), false
 			while B.running and not B.botDown() and os.clock() - started < C.CARRY_APPROACH_TIMEOUT do
 				if not ownerKnocked() then return end
-				local _, oRoot = B.getParts(oPlr)
+				local head = headOf(oPlr)
 				local _, root = B.getParts(lp)
-				if not (oRoot and root) then return end
-				if B.flatDist(root.Position, oRoot.Position) <= C.CARRY_GRAB_DIST
-					and math.abs(root.Position.Y - oRoot.Position.Y) < 6 then
+				if not (head and root) then return end
+				if B.flatDist(root.Position, head.Position) <= C.CARRY_GRAB_DIST
+					and math.abs(root.Position.Y - head.Position.Y) < 6 then
 					near = true
 					break
 				end
-				B.healGoal = oRoot.Position
+				B.healGoal = head.Position
 				task.wait(0.1)
 			end
 			B.healGoal = nil
 			if not near then say("couldn't reach the owner"); return end
 
 			-- 2. grab
-			local how = carryAction(oPlr and oPlr.Character)
+			local head = headOf(oPlr)
+			local _, myRoot = B.getParts(lp)
+			if head and myRoot then -- face the head before pressing G
+				myRoot.CFrame = CFrame.lookAt(myRoot.Position, Vector3.new(head.Position.X, myRoot.Position.Y, head.Position.Z))
+				task.wait(0.15)
+			end
+			local how = carryAction()
 			say("grab via " .. tostring(how))
 			grabbed = true
 			task.wait(0.6)
@@ -191,7 +182,7 @@ return function(B)
 		B.healGoal = nil
 		-- 5. drop (same trigger again) - also when something went wrong after the grab
 		if grabbed and B.running then
-			local how = carryAction(oPlr and oPlr.Character)
+			local how = carryAction()
 			say("drop via " .. tostring(how))
 			task.wait(0.4)
 		end
