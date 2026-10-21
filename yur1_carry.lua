@@ -1,40 +1,51 @@
--- yur1_carry.lua  (carry mode: a bot carries the knocked-out owner to the nearest armor shop)
+-- yur1_carry.lua (fixed)  carry mode: a bot carries the knocked-out owner to the nearest armor shop
 -- Loaded by yur1.lua. Uses B.healGoal / B.healing like the shop module, and sets B.carry = {active, mine}.
---
--- HOW IT WORKS (every running bot runs this, all of them reach the same decision without talking)
---   * Carry mode switch on (menu > Settings) and the OWNER is knocked out (K.O, not dead)
---       -> B.carry.active = true on every bot (the main script then keeps the fighters close to the owner and
---          allows only C.CARRY_CHASERS bots to chase, so the others watch for incoming attacks)
---   * 0.6s after the knock-out the bot that is CLOSEST to the owner becomes the carrier (ties: name order).
---     The choice is locked until the owner is up again.
---   * The carrier: runs to the owner's HEAD > presses G (carry) > walks to the nearest armor shop >
---     presses G again (drop) next to the shop.  The owner buys / heals there.
---   * The key is C.CARRY_KEY (default "G").
 
 return function(B)
 	local C, lp = B.C, B.lp
 	local Players = game:GetService("Players")
 	local lowerName = string.lower(lp.Name)
 
+	-- defaults so a missing config value can't crash the loop
+	local DEFAULTS = {
+		CARRY_KEY = "G",
+		CARRY_SPEED = C.HEAL_WALK_SPEED or 16,
+		CARRY_APPROACH_TIMEOUT = 15,
+		CARRY_GRAB_DIST = 6,
+		CARRY_SHOP_DIST = 4,
+		CARRY_WALK_TIMEOUT = 40,
+		CARRY_COOLDOWN = 3,
+	}
+	for k, v in pairs(DEFAULTS) do
+		if C[k] == nil then C[k] = v end
+	end
+
 	B.carry = B.carry or {active = false, mine = false}
 	B.carry.active, B.carry.mine = false, false
+	B.restores = B.restores or {}
 
-	local episode = {ko = false, since = 0, decided = false, mine = false}
+	local episode = {ko = false, since = 0, decided = false, mine = false, warnedOff = false}
 	local lastEnd = -1e9
 	local armorScanAt = -100
 
 	local function say(...) print("[bodyguard] carry:", ...) end
 
+	if not B.VIM then say("WARNING: B.VIM is nil, key presses will not work") end
+	if not C.ARMOR_MODEL_NAME then say("WARNING: C.ARMOR_MODEL_NAME is nil, no armor shop can be found") end
+
 	-- ─── owner state ──────────────────────────────────────────────────────────────────────────
 	local function effectValue(plr, name)
+		local effects
 		local folder = workspace:FindFirstChild("Players")
 		folder = folder and folder:FindFirstChild(plr.Name)
-		local effects = folder and folder:FindFirstChild("BodyEffects")
+		effects = folder and folder:FindFirstChild("BodyEffects")
+		if not effects and plr.Character then
+			effects = plr.Character:FindFirstChild("BodyEffects")
+		end
 		local v = effects and effects:FindFirstChild(name)
 		return v and v.Value
 	end
 
-	-- true when the owner is knocked out but NOT dead (a dead owner can't be carried)
 	local function ownerKnocked()
 		local op = B.ownerPlayer()
 		if not op then return false end
@@ -44,12 +55,13 @@ return function(B)
 		return effectValue(op, "K.O") == true
 	end
 
-	-- is this bot the closest running bot to the owner
 	local function iAmClosest()
 		local _, oRoot = B.getParts(B.ownerPlayer())
 		if not oRoot then return false end
+		local names = B.activeNames
+		if not names or #names == 0 then return true end -- no list: assume I'm the only bot
 		local bestName, bestD
-		for _, n in ipairs(B.activeNames or {}) do
+		for _, n in ipairs(names) do
 			local p = Players:FindFirstChild(n)
 			local _, r = B.getParts(p)
 			if r then
@@ -63,7 +75,7 @@ return function(B)
 		return bestName == lowerName
 	end
 
-	-- ─── the carry action (grab / drop use the same trigger) ──────────────────────────────────
+	-- ─── carry action (same key grabs and drops) ──────────────────────────────────────────────
 	local function pressKey(name)
 		local VIM = B.VIM
 		local ok, kc = pcall(function() return Enum.KeyCode[name] end)
@@ -76,13 +88,11 @@ return function(B)
 		return true
 	end
 
-	-- grab and drop are the same key (G): first press carries, second press drops
 	local function carryAction()
 		if pressKey(C.CARRY_KEY) then return "key " .. tostring(C.CARRY_KEY) end
 		return nil
 	end
 
-	-- the owner's head (falls back to the root part) - the carrier walks to this
 	local function headOf(plr)
 		local char = plr and plr.Character
 		return char and (char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart"))
@@ -91,11 +101,13 @@ return function(B)
 	-- ─── armor shops ──────────────────────────────────────────────────────────────────────────
 	local function armorHeads()
 		local heads = {}
+		local name = C.ARMOR_MODEL_NAME
+		if not name then return heads end
 		local ignored = workspace:FindFirstChild("Ignored")
 		local shop = ignored and ignored:FindFirstChild("Shop")
 		if shop then
 			for _, child in ipairs(shop:GetChildren()) do
-				if child.Name == C.ARMOR_MODEL_NAME then
+				if child.Name == name then
 					local h = child:FindFirstChild("Head")
 					if h then heads[#heads + 1] = h end
 				end
@@ -104,7 +116,7 @@ return function(B)
 		if #heads == 0 and os.clock() - armorScanAt > 10 then
 			armorScanAt = os.clock()
 			for _, d in ipairs(workspace:GetDescendants()) do
-				if d.Name == C.ARMOR_MODEL_NAME and d:IsA("Model") then
+				if d.Name == name and d:IsA("Model") then
 					local h = d:FindFirstChild("Head")
 					if h then heads[#heads + 1] = h end
 				end
@@ -115,6 +127,7 @@ return function(B)
 
 	-- ─── the carry run (carrier only) ─────────────────────────────────────────────────────────
 	local function run()
+		say("starting run")
 		B.healing, B.carrying = true, true
 		B.healSpeed = C.CARRY_SPEED
 		local grabbed = false
@@ -137,12 +150,12 @@ return function(B)
 				task.wait(0.1)
 			end
 			B.healGoal = nil
-			if not near then say("couldn't reach the owner"); return end
+			if not near then say("couldn't reach the owner (is anything consuming B.healGoal in yur1.lua?)"); return end
 
 			-- 2. grab
 			local head = headOf(oPlr)
 			local _, myRoot = B.getParts(lp)
-			if head and myRoot then -- face the head before pressing G
+			if head and myRoot then
 				myRoot.CFrame = CFrame.lookAt(myRoot.Position, Vector3.new(head.Position.X, myRoot.Position.Y, head.Position.Z))
 				task.wait(0.15)
 			end
@@ -151,7 +164,7 @@ return function(B)
 			grabbed = true
 			task.wait(0.6)
 
-			-- 3. nearest armor shop (to the bot, who is now standing at the owner)
+			-- 3. nearest armor shop
 			local _, root = B.getParts(lp)
 			if not root then return end
 			local best, bestD
@@ -167,10 +180,10 @@ return function(B)
 			away = away.Magnitude > 0.1 and away.Unit or Vector3.new(0, 0, 1)
 			local spot = best.Position + away * C.CARRY_SHOP_DIST
 
-			-- 4. walk there (the follow loop does the pathing)
+			-- 4. walk there
 			started = os.clock()
 			while B.running and not B.botDown() and os.clock() - started < C.CARRY_WALK_TIMEOUT do
-				if not ownerKnocked() then break end -- the owner got up / was revived
+				if not ownerKnocked() then break end
 				local _, r = B.getParts(lp)
 				if not r then break end
 				if B.flatDist(r.Position, spot) <= 3 then break end
@@ -180,7 +193,7 @@ return function(B)
 		end)
 
 		B.healGoal = nil
-		-- 5. drop (same trigger again) - also when something went wrong after the grab
+		-- 5. drop
 		if grabbed and B.running then
 			local how = carryAction()
 			say("drop via " .. tostring(how))
@@ -197,33 +210,49 @@ return function(B)
 		B.carry.active, B.carry.mine = false, false
 	end)
 
+	local function tick()
+		local ko = ownerKnocked()
+		local knocked = C.CARRY_ENABLED and ko
+		local now = os.clock()
+
+		if ko and not C.CARRY_ENABLED then
+			if not episode.warnedOff then
+				episode.warnedOff = true
+				say("owner is K.O but carry mode is OFF (C.CARRY_ENABLED is " .. tostring(C.CARRY_ENABLED) .. ")")
+			end
+		elseif not ko then
+			episode.warnedOff = false
+		end
+
+		if knocked then
+			if not episode.ko then
+				episode.ko, episode.since, episode.decided, episode.mine = true, now, false, false
+				say("owner knocked out")
+			end
+			if not episode.decided and now - episode.since >= 0.6 then
+				episode.decided = true
+				episode.mine = iAmClosest()
+				if episode.mine then say("I'm the carrier") end
+			end
+			B.carry.active = true
+			B.carry.mine = episode.decided and episode.mine
+
+			if B.carry.mine and not B.healing and not B.sequencing and not B.botDown()
+				and now - lastEnd > C.CARRY_COOLDOWN then
+				run()
+				lastEnd = os.clock()
+			end
+		else
+			episode.ko = false
+			B.carry.active, B.carry.mine = false, false
+		end
+	end
+
 	task.spawn(function()
 		while B.running do
 			task.wait(0.25)
-			local knocked = C.CARRY_ENABLED and ownerKnocked()
-			local now = os.clock()
-
-			if knocked then
-				if not episode.ko then
-					episode.ko, episode.since, episode.decided, episode.mine = true, now, false, false
-				end
-				if not episode.decided and now - episode.since >= 0.6 then
-					episode.decided = true
-					episode.mine = iAmClosest()
-					if episode.mine then say("I'm the carrier") end
-				end
-				B.carry.active = true
-				B.carry.mine = episode.decided and episode.mine
-
-				if B.carry.mine and not B.healing and not B.sequencing and not B.botDown()
-					and now - lastEnd > C.CARRY_COOLDOWN then
-					run()
-					lastEnd = os.clock()
-				end
-			else
-				episode.ko = false
-				B.carry.active, B.carry.mine = false, false
-			end
+			local ok, err = pcall(tick)
+			if not ok then warn("[bodyguard] carry watcher error: " .. tostring(err)) end
 		end
 	end)
 
