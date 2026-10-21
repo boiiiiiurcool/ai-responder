@@ -177,6 +177,13 @@ return function(U)
 	altLayout.Padding = UDim.new(0, 6)
 	altLayout.SortOrder = Enum.SortOrder.LayoutOrder
 	altLayout.Parent = altList
+	do -- keeps the first row's outline from being clipped by the scroll frame
+		local pad = Instance.new("UIPadding")
+		pad.PaddingLeft = UDim.new(0, 2)
+		pad.PaddingTop = UDim.new(0, 2)
+		pad.PaddingBottom = UDim.new(0, 2)
+		pad.Parent = altList
+	end
 
 	local emptyLabel = Instance.new("TextLabel")
 	emptyLabel.BackgroundTransparency = 1
@@ -200,6 +207,337 @@ return function(U)
 			if string.lower(p.Name) == l or string.lower(p.DisplayName) == l then return p end
 		end
 	end
+
+	---------------------------------------------------------------- Info side panel
+	-- Opens to the right of the window (the window widens). Pick any alt with the profile chips on top.
+	-- Everything is read from what this account can see of the alt in the server; "Doing" is worked out
+	-- from that (tool, speed, knocked out ...), the alt itself doesn't report it.
+	local PANEL_W = 210
+	local SIDE_EXTRA = PANEL_W + 8
+	local panelOpen, selectedId, chipSig = false, nil, nil
+	local thumbs = {}
+
+	local function setAvatar(img, userId)
+		if thumbs[userId] then img.Image = thumbs[userId]; return end
+		task.spawn(function()
+			local ok, url = pcall(function()
+				return Players:GetUserThumbnailAsync(userId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size48x48)
+			end)
+			if ok and url then
+				thumbs[userId] = url
+				if img.Parent then img.Image = url end
+			end
+		end)
+	end
+
+	local panel = Instance.new("Frame")
+	panel.Name = "InfoPanel"
+	panel.Position = UDim2.new(1, -(PANEL_W + 16), 0, 52)
+	panel.Size = UDim2.new(0, PANEL_W, 1, -68)
+	panel.BackgroundColor3 = PANEL_COLOR
+	panel.BorderSizePixel = 0
+	panel.Visible = false
+	panel.Parent = root
+	addCorner(panel, 8)
+	addStroke(panel, 0.4)
+
+	local panelTitle = Instance.new("TextLabel")
+	panelTitle.BackgroundTransparency = 1
+	panelTitle.Position = UDim2.fromOffset(12, 8)
+	panelTitle.Size = UDim2.new(1, -52, 0, 20)
+	panelTitle.Font = Enum.Font.GothamMedium
+	panelTitle.Text = "Bot info"
+	panelTitle.TextColor3 = TEXT_COLOR
+	panelTitle.TextSize = 13
+	panelTitle.TextXAlignment = Enum.TextXAlignment.Left
+	panelTitle.Parent = panel
+
+	local closeBtn = smallButton(panel, "X", UDim2.new(1, -34, 0, 7), UDim2.fromOffset(24, 22))
+	closeBtn.TextSize = 12
+
+	-- alt picker: one profile chip per alt
+	local chips = Instance.new("ScrollingFrame")
+	chips.Position = UDim2.fromOffset(8, 34)
+	chips.Size = UDim2.new(1, -16, 0, 44)
+	chips.BackgroundTransparency = 1
+	chips.BorderSizePixel = 0
+	chips.ScrollBarThickness = 2
+	chips.ScrollBarImageColor3 = OUTLINE_COLOR
+	chips.ScrollingDirection = Enum.ScrollingDirection.X
+	chips.CanvasSize = UDim2.new()
+	chips.AutomaticCanvasSize = Enum.AutomaticSize.X
+	chips.Parent = panel
+
+	local chipLayout = Instance.new("UIListLayout")
+	chipLayout.FillDirection = Enum.FillDirection.Horizontal
+	chipLayout.Padding = UDim.new(0, 6)
+	chipLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	chipLayout.Parent = chips
+	do
+		local pad = Instance.new("UIPadding")
+		pad.PaddingLeft = UDim.new(0, 3)
+		pad.PaddingTop = UDim.new(0, 4)
+		pad.Parent = chips
+	end
+
+	-- profile block
+	local bigAvatar = Instance.new("ImageLabel")
+	bigAvatar.Position = UDim2.fromOffset(12, 86)
+	bigAvatar.Size = UDim2.fromOffset(44, 44)
+	bigAvatar.BackgroundColor3 = BG_COLOR
+	bigAvatar.BorderSizePixel = 0
+	bigAvatar.Parent = panel
+	addCorner(bigAvatar, 22)
+
+	local nameText = Instance.new("TextLabel")
+	nameText.BackgroundTransparency = 1
+	nameText.Position = UDim2.fromOffset(64, 88)
+	nameText.Size = UDim2.new(1, -72, 0, 18)
+	nameText.Font = Enum.Font.GothamMedium
+	nameText.Text = ""
+	nameText.TextColor3 = TEXT_COLOR
+	nameText.TextSize = 13
+	nameText.TextXAlignment = Enum.TextXAlignment.Left
+	nameText.TextTruncate = Enum.TextTruncate.AtEnd
+	nameText.Parent = panel
+
+	local subText = Instance.new("TextLabel")
+	subText.BackgroundTransparency = 1
+	subText.Position = UDim2.fromOffset(64, 108)
+	subText.Size = UDim2.new(1, -72, 0, 16)
+	subText.Font = Enum.Font.Gotham
+	subText.Text = ""
+	subText.TextColor3 = DIM_TEXT
+	subText.TextSize = 11
+	subText.TextXAlignment = Enum.TextXAlignment.Left
+	subText.TextTruncate = Enum.TextTruncate.AtEnd
+	subText.Parent = panel
+
+	local stats = Instance.new("Frame")
+	stats.Position = UDim2.fromOffset(8, 140)
+	stats.Size = UDim2.new(1, -16, 1, -148)
+	stats.BackgroundTransparency = 1
+	stats.Parent = panel
+
+	local statLayout = Instance.new("UIListLayout")
+	statLayout.Padding = UDim.new(0, 4)
+	statLayout.SortOrder = Enum.SortOrder.LayoutOrder
+	statLayout.Parent = stats
+
+	local statOrder = 0
+	local function makeStat(label, tall)
+		statOrder += 1
+		local row = Instance.new("Frame")
+		row.LayoutOrder = statOrder
+		row.Size = UDim2.new(1, 0, 0, tall and 40 or 22)
+		row.BackgroundColor3 = BG_COLOR
+		row.BorderSizePixel = 0
+		row.Parent = stats
+		addCorner(row, 5)
+
+		local l = Instance.new("TextLabel")
+		l.BackgroundTransparency = 1
+		l.Position = UDim2.fromOffset(8, 0)
+		l.Size = UDim2.new(0.38, -8, 0, 22)
+		l.Font = Enum.Font.Gotham
+		l.Text = label
+		l.TextColor3 = DIM_TEXT
+		l.TextSize = 11
+		l.TextXAlignment = Enum.TextXAlignment.Left
+		l.Parent = row
+
+		local v = Instance.new("TextLabel")
+		v.BackgroundTransparency = 1
+		if tall then
+			v.Position = UDim2.fromOffset(8, 16)
+			v.Size = UDim2.new(1, -16, 0, 22)
+			v.TextXAlignment = Enum.TextXAlignment.Left
+		else
+			v.Position = UDim2.new(0.38, 0, 0, 0)
+			v.Size = UDim2.new(0.62, -8, 1, 0)
+			v.TextXAlignment = Enum.TextXAlignment.Right
+		end
+		v.Font = Enum.Font.GothamMedium
+		v.Text = "-"
+		v.TextColor3 = TEXT_COLOR
+		v.TextSize = 11
+		v.TextWrapped = true
+		v.TextTruncate = Enum.TextTruncate.AtEnd
+		v.Parent = row
+		return v
+	end
+
+	local doingV   = makeStat("Doing", true)
+	local distV    = makeStat("Distance from you")
+	local subDistV = makeStat("From sub owner")
+	local healthV  = makeStat("Health")
+	local armorV   = makeStat("Armor")
+	local holdV    = makeStat("Holding")
+	local speedV   = makeStat("Speed")
+
+	local function bodyEffect(p, valueName)
+		local folder = workspace:FindFirstChild("Players")
+		folder = folder and folder:FindFirstChild(p.Name)
+		local effects = folder and folder:FindFirstChild("BodyEffects")
+		local v = effects and effects:FindFirstChild(valueName)
+		return v and v.Value
+	end
+
+	local function rootOf(p)
+		return p and p.Character and p.Character:FindFirstChild("HumanoidRootPart")
+	end
+
+	local function setPages(open)
+		local extra = open and SIDE_EXTRA or 0
+		accountsPage.Size = UDim2.new(1, -32 - extra, 1, -68)
+		settingsPage.Size = UDim2.new(1, -32 - extra, 1, -68)
+		if U.setSideWidth then U.setSideWidth(open and SIDE_EXTRA or 0) end
+	end
+
+	local function closeInfo()
+		if not panelOpen then return end
+		panelOpen = false
+		panel.Visible = false
+		setPages(false)
+	end
+
+	local function rebuildChips()
+		local parts = {}
+		for _, a in ipairs(currentAlts) do parts[#parts + 1] = tostring(a.id) end
+		local sig = table.concat(parts, ",")
+		if sig == chipSig then return end
+		chipSig = sig
+		for _, c in ipairs(chips:GetChildren()) do
+			if c:IsA("ImageButton") then c:Destroy() end
+		end
+		for i, a in ipairs(currentAlts) do
+			local chip = Instance.new("ImageButton")
+			chip.Name = "chip" .. tostring(a.id)
+			chip.LayoutOrder = i
+			chip.Size = UDim2.fromOffset(32, 32)
+			chip.BackgroundColor3 = BG_COLOR
+			chip.BorderSizePixel = 0
+			chip.AutoButtonColor = false
+			chip.Parent = chips
+			addCorner(chip, 16)
+			local st = addStroke(chip, 1)
+			st.Name = "Sel"
+			setAvatar(chip, a.id)
+			chip.Activated:Connect(function()
+				selectedId = a.id
+				if panelOpen then m.updateInfo() end
+			end)
+		end
+	end
+
+	function m.updateInfo()
+		if not panelOpen then return end
+		rebuildChips()
+
+		local alt
+		for _, a in ipairs(currentAlts) do
+			if a.id == selectedId then alt = a end
+		end
+		if not alt then
+			alt = currentAlts[1]
+			if not alt then closeInfo(); return end
+			selectedId = alt.id
+		end
+
+		for _, c in ipairs(chips:GetChildren()) do
+			if c:IsA("ImageButton") then
+				local st = c:FindFirstChild("Sel")
+				if st then st.Transparency = (c.Name == "chip" .. tostring(selectedId)) and 0 or 1 end
+			end
+		end
+
+		local p = Players:GetPlayerByUserId(alt.id)
+		setAvatar(bigAvatar, alt.id)
+		nameText.Text = p and p.DisplayName or alt.name
+		subText.Text = "@" .. alt.name .. "  -  " .. (alt.on and "Running" or "Stopped")
+
+		local char = p and p.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local aRoot = rootOf(p)
+		local myRoot = rootOf(player)
+		local subP = control.subOwner ~= "" and findServerPlayer(control.subOwner) or nil
+		local sRoot = rootOf(subP)
+
+		-- distances
+		if aRoot and myRoot then
+			distV.Text = string.format("%.0f studs", (aRoot.Position - myRoot.Position).Magnitude)
+		else
+			distV.Text = "n/a"
+		end
+		if control.subOwner == "" then
+			subDistV.Text = "no sub owner"
+		elseif aRoot and sRoot then
+			subDistV.Text = string.format("%.0f studs", (aRoot.Position - sRoot.Position).Magnitude)
+		else
+			subDistV.Text = "n/a"
+		end
+
+		-- body
+		healthV.Text = hum and string.format("%d / %d", math.floor(hum.Health), math.floor(hum.MaxHealth)) or "n/a"
+		local armor = p and bodyEffect(p, "Armor")
+		armorV.Text = (type(armor) == "number") and tostring(math.floor(armor)) or "n/a"
+		local tool = char and char:FindFirstChildWhichIsA("Tool")
+		holdV.Text = tool and tool.Name or "nothing"
+		local speed = 0
+		if aRoot then
+			local v = aRoot.AssemblyLinearVelocity
+			speed = Vector3.new(v.X, 0, v.Z).Magnitude
+		end
+		speedV.Text = aRoot and string.format("%.0f", speed) or "n/a"
+
+		-- what it is doing (worked out from what we can see)
+		local doing
+		if not p then
+			doing = "Not in this server"
+		elseif not alt.on then
+			doing = "Stopped (not controlled)"
+		elseif not (hum and aRoot) then
+			doing = "Respawning"
+		elseif hum.Health <= 0 or bodyEffect(p, "Dead") == true then
+			doing = "Dead - respawning"
+		elseif bodyEffect(p, "K.O") == true then
+			doing = "Knocked out"
+		elseif tool and string.find(string.lower(tool.Name), "stim", 1, true) then
+			doing = "Healing (stim)"
+		elseif tool then
+			doing = "Fighting - holding " .. tool.Name
+		elseif speed >= 40 then
+			doing = "Running fast - catching up / chasing"
+		elseif speed > 1 then
+			doing = "Following you"
+		else
+			doing = "Holding position"
+		end
+		doingV.Text = doing
+	end
+
+	local function openInfo(id)
+		if panelOpen and selectedId == id then
+			closeInfo()
+			return
+		end
+		selectedId = id
+		if not panelOpen then
+			panelOpen = true
+			panel.Visible = true
+			setPages(true)
+		end
+		m.updateInfo()
+	end
+
+	closeBtn.Activated:Connect(closeInfo)
+
+	task.spawn(function()
+		while U.isAlive() and root.Parent do
+			task.wait(0.25)
+			if panelOpen then pcall(m.updateInfo) end
+		end
+	end)
 
 	-- spectate the sub owner (button toggles)
 	local spectating = false
@@ -313,6 +651,7 @@ return function(U)
 			end
 		end
 		currentAlts = alts
+		if panelOpen then task.defer(function() pcall(m.updateInfo) end) end
 		summary.Text = runningCount .. " / " .. #alts .. " running"
 		local hasSub = control.subOwner ~= ""
 		local subHere = hasSub and findServerPlayer(control.subOwner) ~= nil
@@ -379,7 +718,7 @@ return function(U)
 			local nameLabel = Instance.new("TextLabel")
 			nameLabel.BackgroundTransparency = 1
 			nameLabel.Position = UDim2.fromOffset(12, 0)
-			nameLabel.Size = UDim2.new(1, -176, 1, 0)
+			nameLabel.Size = UDim2.new(1, -204, 1, 0)
 			nameLabel.Font = Enum.Font.Gotham
 			nameLabel.Text = a.name
 			nameLabel.TextColor3 = TEXT_COLOR
@@ -390,8 +729,8 @@ return function(U)
 
 			local status = Instance.new("TextLabel")
 			status.BackgroundTransparency = 1
-			status.Position = UDim2.new(1, -164, 0, 0)
-			status.Size = UDim2.new(0, 76, 1, 0)
+			status.Position = UDim2.new(1, -192, 0, 0)
+			status.Size = UDim2.new(0, 66, 1, 0)
 			status.Font = Enum.Font.GothamMedium
 			status.Text = a.on and "Running" or "Stopped"
 			status.TextColor3 = a.on and TEXT_COLOR or DIM_TEXT
@@ -400,12 +739,16 @@ return function(U)
 			status.Parent = row
 
 			local toggle = smallButton(row, a.on and "Stop" or "Start",
-				UDim2.new(1, -76, 0.5, -12), UDim2.fromOffset(64, 24))
+				UDim2.new(1, -70, 0.5, -12), UDim2.fromOffset(62, 24))
 			toggle.TextSize = 12
 			toggle.Activated:Connect(function()
 				setRun(a.id, not a.on)
 				if lastData then m.refresh(lastData) end
 			end)
+
+			local infoBtn = smallButton(row, "Info", UDim2.new(1, -122, 0.5, -12), UDim2.fromOffset(46, 24))
+			infoBtn.TextSize = 12
+			infoBtn.Activated:Connect(function() openInfo(a.id) end)
 		end
 	end
 
