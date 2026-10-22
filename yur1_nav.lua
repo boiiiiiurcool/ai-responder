@@ -183,6 +183,7 @@ return function(B)
 	end
 
 	if UGS then
+		pcall(RunService.UnbindFromRenderStep, RunService, "yur1NavShiftLock")
 		RunService:BindToRenderStep("yur1NavShiftLock", Enum.RenderPriority.Camera.Value + 1, function()
 			pcall(function()
 				if lockDir and os.clock() < lockUntil then
@@ -646,7 +647,7 @@ return function(B)
 			end
 		end
 
-		local s = {p = feet, air = air, climb = climb}
+		local s = {p = feet, air = air, climb = climb, t = os.clock()}
 		if last then
 			if air and not last.air and not climb then
 				last.takeoff = true
@@ -704,6 +705,10 @@ return function(B)
 		if nearDist(goalFeet, pts[n].p) > 18 then return false end -- only when the goal is the owner
 		local a = anchorFor(feet)
 		if not a or a >= n - 1 then return false end
+		if now - pts[a].t > 30 then return false end -- old path: never replay it
+		local len = 0
+		for i = a, n - 1 do len += (pts[i + 1].p - pts[i].p).Magnitude end
+		if len > 150 then return false end -- too long to be "right behind the owner"
 		if not (hardAhead(a) or abs(goalFeet.Y - feet.Y) > C.NAV_VERT_MIN or S.failures >= 2) then return false end
 		S.tr = {n = pts[a].n, prog = now, lastIdx = -1, tries = 0}
 		return true
@@ -1047,7 +1052,7 @@ return function(B)
 
 		-- not called for a while (bot was holding still): forget the stuck counters
 		if now - S.lastStepAt > 0.5 then
-			S.stuck, S.lastPos, S.recoverPoint = 0, nil, nil
+			S.stuck, S.lastPos, S.recoverPoint, S.win = 0, nil, nil, nil
 		end
 		S.lastStepAt = now
 
@@ -1080,6 +1085,15 @@ return function(B)
 			S.stuck = 0
 			local tgt = S.stations and S.stations[S.stIdx]
 			escalate(feet, tgt and tgt.pos or goalFeet, hum, now)
+		end
+		-- oscillation watchdog: the bot IS moving (sliding along a wall, jittering at a corner) but gets nowhere
+		if air or S.tr or S.climbing then
+			S.win = nil
+		elseif not S.win or now - S.win.t >= 2 then
+			if S.win and (feet - S.win.p).Magnitude < 3 and nearDist(feet, goalFeet) > 6 then
+				escalate(feet, goalFeet, hum, now)
+			end
+			S.win = {p = feet, t = now}
 		end
 		if S.recoverPoint and now < S.recoverUntil then B.navTrail = false; return S.recoverPoint, false end
 
