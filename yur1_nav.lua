@@ -19,7 +19,7 @@ return function(B)
 		NAV_ROOM_RADIUS = 26, NAV_ROOM_CLOSED = 0.7, NAV_OPEN_MIN = 12,
 		NAV_DOOR_MIN = 2.5, NAV_DOOR_MAX = 14, NAV_VERT_MIN = 7,
 		NAV_GRID = 3, NAV_GRID_MAX = 1200, NAV_GRID_TIME = 4,
-		NAV_SMOOTH_LOOK = 8, NAV_STATION_TIME = 16, NAV_SHIFTLOCK = true,
+		NAV_SMOOTH_LOOK = 8, NAV_STATION_TIME = 16, NAV_SHIFTLOCK = true, NAV_TRAIL = true,
 		PATH_LOOKAHEAD = 4, PATH_REPLAN_DIST = 8, SEPARATION_DIST = 6,
 		SEPARATION_PUSH = 6, LANE_WIDTH = 3, TIGHT_SEP = 2.5,
 	}) do
@@ -89,6 +89,7 @@ return function(B)
 		recoverPoint = nil, recoverUntil = 0, sideDir = 1, forceGridUntil = 0,
 		bad = {}, badCount = 0, doorFail = {}, hist = {}, histAt = 0, failures = 0,
 		wpIdx = nil, wpAt = 0, blockedConn = nil, pathObj = nil, direct = nil, climbing = nil,
+		trail = nil, trailBlock = 0, trailChk = 0,
 	}
 	local scanCache, scanCount = {}, 0
 
@@ -794,6 +795,104 @@ return function(B)
 		return V3(tp.X, targetY + C.NAV_HIP, tp.Z)
 	end
 
+	-- ═══ owner trail (obbies, gaps, parkour) ═══
+	-- The owner's real path is recorded (position, in-air flag, take-off points). When walking / pathfinding can't
+	-- reach the owner and the trail shows jumps or big height changes, the bot REPLAYS the owner's path and jumps
+	-- where the owner jumped, instead of searching for a ladder or a walkable route that doesn't exist.
+	local T = {pts = {}, nextN = 1, player = nil, lastAt = 0}
+
+	local function trailAdd(feet, air)
+		local pts = T.pts
+		local last = pts[#pts]
+		if last and (feet - last.pos).Magnitude > 60 then table.clear(pts); last = nil end -- teleport
+		if last and air == last.air and (feet - last.pos).Magnitude < 1.5 then return end
+		if air and last and not last.air then last.jump = true end -- last grounded sample = take-off point
+		pts[#pts + 1] = {pos = feet, air = air, jump = false, n = T.nextN}
+		T.nextN += 1
+		if #pts > 400 then table.remove(pts, 1) end
+	end
+
+	table.insert(B.conns, game:GetService("RunService").Heartbeat:Connect(function()
+		if not (B.running and C.NAV_TRAIL) then return end
+		local now = os.clock()
+		if now - T.lastAt < 0.08 then return end
+		T.lastAt = now
+		local owner = B.ownerPlayer and B.ownerPlayer()
+		if owner ~= T.player then T.player = owner; table.clear(T.pts) end
+		local hum, root = getParts(owner)
+		if hum and root then
+			trailAdd(root.Position - HIPV, hum.FloorMaterial == Enum.Material.Air)
+		end
+	end))
+
+	-- nearest recorded sample to the bot (newest wins ties), nil when none is within 25 studs
+	local function trailAnchor(feet)
+		local pts, best, bd = T.pts, nil, 25
+		for i = #pts, 1, -1 do
+			local d = (pts[i].pos - feet).Magnitude
+			if d < bd then best, bd = i, d end
+		end
+		return best
+	end
+
+	local function useTrail(feet, goalFeet, now)
+		if not C.NAV_TRAIL or now < S.trailBlock or now - S.trailChk < 0.25 then return false end
+		S.trailChk = now
+		local pts = T.pts
+		local n = #pts
+		if n < 3 or flatDist(goalFeet, pts[n].pos) > 25 then return false end -- only when the goal is the owner
+		local a = trailAnchor(feet)
+		if not a or a >= n - 1 then return false end
+		local needs = S.failures >= 2 or math.abs(goalFeet.Y - feet.Y) > C.NAV_VERT_MIN
+		if not needs then
+			for i = a, n do
+				if pts[i].air or pts[i].jump then needs = true; break end
+			end
+		end
+		if not needs then return false end
+		S.trail = {n = (flatDist(feet, pts[a].pos) < 2.5 and pts[a + 1] or pts[a]).n}
+		return true
+	end
+
+	-- returns the root-level point to MoveTo, or nil when the trail is finished / lost
+	local function followTrail(feet, hum, now)
+		local tr, pts = S.trail, T.pts
+		if #pts == 0 then S.trail = nil; return nil end
+		local i = math.clamp(tr.n - pts[1].n + 1, 1, #pts)
+		local cur = pts[i]
+
+		-- fell off / lost the trail: re-acquire, otherwise hand back to the normal planner
+		if feet.Y < cur.pos.Y - 14 or flatDist(feet, cur.pos) > 35 then
+			local a = trailAnchor(feet)
+			if not a then S.trail, S.trailBlock = nil, now + 3; return nil end
+			i, cur = a, pts[a]
+		end
+
+		-- overshoot: a later grounded sample is already under our feet (never skips a take-off point)
+		for k = math.min(#pts, i + 3), i + 1, -1 do
+			local s = pts[k]
+			if not s.air and flatDist(feet, s.pos) < 2.2 and math.abs(feet.Y - s.pos.Y) < 3 then
+				local clean = true
+				for m = i, k - 1 do
+					if pts[m].jump then clean = false; break end
+				end
+				if clean then i, cur = k, s; break end
+			end
+		end
+
+		local reach = cur.air and 3.5 or 2.2
+		if flatDist(feet, cur.pos) < reach and (cur.air or math.abs(feet.Y - cur.pos.Y) < 5) then
+			if cur.jump then jump(hum) end
+			if i >= #pts then S.trail = nil; return nil end -- caught up with the owner
+			i += 1
+			cur = pts[i]
+		end
+		tr.n = cur.n
+
+		if cur.jump and flatDist(feet, cur.pos) < 3 then jump(hum) end
+		return cur.pos + HIPV
+	end
+
 	-- ═══ the step the main script calls ═══
 	local function step(goalRoot, dt, alt)
 		local hum, root = getParts(lp)
@@ -832,8 +931,12 @@ return function(B)
 		if S.stuck > 0.35 then jump(hum) end
 		if S.stuck > 0.7 then
 			S.stuck = 0
-			local tgt = S.stations and S.stations[S.stIdx]
-			escalate(feet, tgt and tgt.pos or goalFeet, hum, now)
+			if S.trail then
+				jump(hum) -- replaying the owner's path: just hop, never side-step off a platform
+			else
+				local tgt = S.stations and S.stations[S.stIdx]
+				escalate(feet, tgt and tgt.pos or goalFeet, hum, now)
+			end
 		end
 		if S.recoverPoint and now < S.recoverUntil then return S.recoverPoint, false end
 
@@ -873,6 +976,18 @@ return function(B)
 			end
 			autoJump(hum, feet, goalRoot)
 			return applySep(rootPos, goalRoot, goalRoot), true
+		end
+
+		-- 1b. owner trail (obbies / gaps): follow where the owner went instead of looking for a ladder
+		if S.trail or useTrail(feet, goalFeet, now) then
+			local tp = followTrail(feet, hum, now)
+			if tp then
+				if S.path or S.stations then
+					invalidate()
+					S.stations = nil
+				end
+				return tp, false -- no separation push here: it could shove a bot off a platform
+			end
 		end
 
 		-- 2. plan
@@ -963,7 +1078,7 @@ return function(B)
 	B.analyze = function(p) return analyze(p - HIPV) end
 	B.navReset = function()
 		invalidate()
-		S.stations, S.stuck, S.stuckLevel, S.climbing = nil, 0, 0, nil
+		S.stations, S.stuck, S.stuckLevel, S.climbing, S.trail = nil, 0, 0, nil, nil
 	end
 
 	table.insert(B.restores, function()
