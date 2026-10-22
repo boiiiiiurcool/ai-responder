@@ -1,17 +1,38 @@
 --[[
-    yur1_nav.lua - pathfinding module (cleaned + optimized)
-    Installs: B.navStep(goal, dt, alt) -> point, direct | B.lineClear(a, b, wide) | B.analyze(pos) | B.navReset()
+    yur1_nav.lua  -  navigation module (full rewrite)
 
-    Order of attempts: ladder -> direct probe -> room exits -> Roblox pathfinding -> grid A* -> smoothing
-    -> following (look-ahead, hop, whiskers, lanes) -> escalating stuck recovery.
+    Installs on the shared table B:
+      B.navStep(goal, dt, alt) -> movePoint, direct   used by the follow / fight / shop loops
+      B.nearDist(a, b)         -> number              distance that also counts HEIGHT (use it for "am I close?")
+      B.lineClear(a, b, wide)  -> bool
+      B.analyze(pos)           -> room / exit scan
+      B.navReset()
+      B.navTrail               -> true while the bot is replaying the owner's path (main script: don't speed up)
+      B.navLost                -> true when the goal is unreachable for a while (main script: teleport to the owner)
+
+    LAYERS (each only runs when the one before it can't solve the move)
+      1. OWNER TRAIL   the owner's real path is recorded (position, airborne, take-off, landing, climbing).
+                       When that path contains a real jump / gap / climb, or the owner is on a different level,
+                       the bot REPLAYS it: it walks the same points and jumps at the same take-off spots.
+                       This is what makes obbies, parkour and gap jumps work.
+      2. DIRECT        straight line when a multi-ray body probe + floor samples say it is walkable.
+      3. LADDERS/ROOMS different floor -> best ladder; goal inside a room -> through its real exits.
+      4. ROBLOX        PathfindingService (several agent sizes / alternate targets).
+      5. GRID A*       own time-sliced raycast A* when Roblox fails or after being stuck.
+      6. FOLLOW        smoothing, look-ahead, auto-hop, whisker steering, lanes + separation.
+      7. RECOVERY      escalating stuck handling (hop, side-step, back-track, escape, force A*).
+
+    Everything that asks "is it close?" is HEIGHT-AWARE: being next to the owner on X/Z while they are
+    10 studs above you is NOT close.
 ]]
 
 return function(B)
 	local Players = game:GetService("Players")
+	local RunService = game:GetService("RunService")
 	local PathfindingService = game:GetService("PathfindingService")
 
 	local C, lp = B.C, B.lp
-	local getParts, flatDist, jump = B.getParts, B.flatDist, B.jump
+	local getParts, jump = B.getParts, B.jump
 	local isBot = B.isBot or function() return false end
 
 	for k, v in pairs({
@@ -19,7 +40,12 @@ return function(B)
 		NAV_ROOM_RADIUS = 26, NAV_ROOM_CLOSED = 0.7, NAV_OPEN_MIN = 12,
 		NAV_DOOR_MIN = 2.5, NAV_DOOR_MAX = 14, NAV_VERT_MIN = 7,
 		NAV_GRID = 3, NAV_GRID_MAX = 1200, NAV_GRID_TIME = 4,
-		NAV_SMOOTH_LOOK = 8, NAV_STATION_TIME = 16, NAV_SHIFTLOCK = true, NAV_TRAIL = true,
+		NAV_SMOOTH_LOOK = 8, NAV_STATION_TIME = 16,
+		NAV_SHIFTLOCK = true,
+		NAV_Y_TOL = 4,            -- height difference (studs) still counted as "same level"
+		NAV_TRAIL = true,         -- replay the owner's path for obbies / gaps / climbs
+		NAV_TRAIL_MAX = 900,      -- recorded samples
+		NAV_TRAIL_REACH = 30,     -- the bot must be this close (3D) to the recorded path to join it
 		PATH_LOOKAHEAD = 4, PATH_REPLAN_DIST = 8, SEPARATION_DIST = 6,
 		SEPARATION_PUSH = 6, LANE_WIDTH = 3, TIGHT_SEP = 2.5,
 	}) do
@@ -27,83 +53,27 @@ return function(B)
 	end
 
 	local V3 = Vector3.new
-	local sqrt, floor, clamp = math.sqrt, math.floor, math.clamp
+	local sqrt, floor, clamp, abs = math.sqrt, math.floor, math.clamp, math.abs
 	local HIPV = V3(0, C.NAV_HIP, 0)
 	local LOW, HIGH = V3(0, 2, 0), V3(0, 4.6, 0) -- ray heights above the feet: hop-able / wall
 	local PI2 = math.pi * 2
 
-	local function dbg(...)
-		if C.NAV_DEBUG then print("[nav]", ...) end
+	-- ═══ distances ═══════════════════════════════════════════════════════════════════════════
+	local function flatDist(a, b)
+		local dx, dz = a.X - b.X, a.Z - b.Z
+		return sqrt(dx * dx + dz * dz)
 	end
 
-	-- ═══ shift lock ═══
-	-- Short bursts of CameraRelative rotation (= shift lock): the bot keeps FACING the goal while it side-steps,
-	-- backs up or slides around a prop, instead of turning away from where it needs to go. Released automatically
-	-- when the burst ends and on unload (the player's original rotation setting is restored).
-	local RunService = game:GetService("RunService")
-	local UGS, savedRotation
-	pcall(function() UGS = UserSettings():GetService("UserGameSettings") end)
-	local lockDir, lockUntil, lockOn = nil, 0, false
-
-	local function lockFace(dir, secs)
-		if not (C.NAV_SHIFTLOCK and UGS) then return end
-		local flat = Vector3.new(dir.X, 0, dir.Z)
-		if flat.Magnitude < 0.1 then return end
-		lockDir, lockUntil = flat.Unit, os.clock() + secs
+	-- horizontal distance, but height beyond NAV_Y_TOL adds to it: "close" means close in 3D
+	local function nearDist(a, b)
+		local dx, dz, dy = a.X - b.X, a.Z - b.Z, abs(a.Y - b.Y)
+		local f2 = dx * dx + dz * dz
+		if dy <= C.NAV_Y_TOL then return sqrt(f2) end
+		local e = (dy - C.NAV_Y_TOL) * 1.5
+		return sqrt(f2 + e * e)
 	end
 
-	local function lockRelease()
-		if lockOn and UGS then
-			pcall(function() UGS.RotationType = savedRotation or Enum.RotationType.MovementRelative end)
-		end
-		lockOn = false
-	end
-
-	if UGS then
-		RunService:BindToRenderStep("yur1NavShiftLock", Enum.RenderPriority.Camera.Value + 1, function()
-			pcall(function()
-				if lockDir and os.clock() < lockUntil then
-					local cam = workspace.CurrentCamera
-					if not cam then return end
-					if not lockOn then
-						savedRotation, lockOn = UGS.RotationType, true
-					end
-					UGS.RotationType = Enum.RotationType.CameraRelative
-					local p = cam.CFrame.Position
-					cam.CFrame = CFrame.lookAt(p, p + lockDir)
-				elseif lockOn then
-					lockRelease()
-				end
-			end)
-		end)
-		table.insert(B.restores, function()
-			pcall(RunService.UnbindFromRenderStep, RunService, "yur1NavShiftLock")
-			lockRelease()
-		end)
-	end
-
-	local S = {
-		path = nil, idx = 1, goal = nil, planAt = 0, planning = false, token = 0, retryAt = 0,
-		stations = nil, stIdx = 1, stGoal = nil, stSince = 0, lastDoor = nil,
-		stuck = 0, stuckLevel = 0, calm = 0, lastPos = nil, lastStepAt = 0,
-		recoverPoint = nil, recoverUntil = 0, sideDir = 1, forceGridUntil = 0,
-		bad = {}, badCount = 0, doorFail = {}, hist = {}, histAt = 0, failures = 0,
-		wpIdx = nil, wpAt = 0, blockedConn = nil, pathObj = nil, direct = nil, climbing = nil,
-		trail = nil, trailBlock = 0, trailChk = 0,
-	}
-	local scanCache, scanCount = {}, 0
-
-	-- time-sliced yielding (replaces fixed per-frame counters): planners never use more than ~4ms per frame
-	local sliceT = 0
-	local function cancelled(token)
-		if os.clock() - sliceT > 0.004 then
-			task.wait()
-			sliceT = os.clock()
-		end
-		return token ~= S.token or not B.running
-	end
-
-	-- ═══ raycasting ═══
+	-- ═══ raycasting ══════════════════════════════════════════════════════════════════════════
 	local rp, rpAt = nil, 0
 	local function cast(origin, dir)
 		local now = os.clock()
@@ -126,9 +96,10 @@ return function(B)
 		return hit and hit.Position
 	end
 
-	local function feetOf(p)
-		local g = groundBelow(p.X, p.Z, p.Y + 1, 30)
-		return (g and p.Y - g.Y < 8) and g or p - HIPV
+	-- floor point under a root-level goal (a jumping owner still maps to the floor below, if it is close)
+	local function goalFeetOf(p)
+		local g = groundBelow(p.X, p.Z, p.Y + 1, 14)
+		return g or (p - HIPV)
 	end
 
 	local function cell2(p, g)
@@ -139,8 +110,8 @@ return function(B)
 		return floor(p.X / 4) .. ":" .. floor(p.Z / 4)
 	end
 
-	-- ═══ body probes (feet level) ═══
-	-- 0 clear, 1 low obstacle (hop), 2 wall. Side rays (half width r) only check wall height: 4 rays instead of 6.
+	-- ═══ body probes (feet level) ════════════════════════════════════════════════════════════
+	-- 0 clear, 1 only a low obstacle (hop), 2 wall. r = half body width for the two side rays.
 	local function wallStatus(a, b, r)
 		local d = b - a
 		local m = sqrt(d.X * d.X + d.Z * d.Z)
@@ -154,7 +125,7 @@ return function(B)
 		return status
 	end
 
-	-- floor samples every ~4 studs: no holes, cliffs or big drops. returns ok, needsJump
+	-- floor samples every ~4 studs: no holes, no cliffs, no big drops. returns ok, needsJump
 	local function groundOK(a, b)
 		local d = b - a
 		local flat = sqrt(d.X * d.X + d.Z * d.Z)
@@ -173,6 +144,7 @@ return function(B)
 		return true, needJump
 	end
 
+	-- full walk check. returns walkable, needsJump
 	local function probe(a, b, r)
 		local st = wallStatus(a, b, r or 1.4)
 		if st == 2 then return false, false end
@@ -191,7 +163,73 @@ return function(B)
 		return m
 	end
 
-	-- ═══ rooms and exits ═══
+	-- ═══ shift lock (short bursts: keep FACING the goal while side-stepping / sliding) ═════════
+	local UGS, savedRotation
+	pcall(function() UGS = UserSettings():GetService("UserGameSettings") end)
+	local lockDir, lockUntil, lockOn = nil, 0, false
+
+	local function lockFace(dir, secs)
+		if not (C.NAV_SHIFTLOCK and UGS) then return end
+		local flat = V3(dir.X, 0, dir.Z)
+		if flat.Magnitude < 0.1 then return end
+		lockDir, lockUntil = flat.Unit, os.clock() + secs
+	end
+
+	local function lockRelease()
+		if lockOn and UGS then
+			pcall(function() UGS.RotationType = savedRotation or Enum.RotationType.MovementRelative end)
+		end
+		lockOn = false
+	end
+
+	if UGS then
+		RunService:BindToRenderStep("yur1NavShiftLock", Enum.RenderPriority.Camera.Value + 1, function()
+			pcall(function()
+				if lockDir and os.clock() < lockUntil then
+					local cam = workspace.CurrentCamera
+					if not cam then return end
+					if not lockOn then savedRotation, lockOn = UGS.RotationType, true end
+					UGS.RotationType = Enum.RotationType.CameraRelative
+					local p = cam.CFrame.Position
+					cam.CFrame = CFrame.lookAt(p, p + lockDir)
+				elseif lockOn then
+					lockRelease()
+				end
+			end)
+		end)
+		table.insert(B.restores, function()
+			pcall(RunService.UnbindFromRenderStep, RunService, "yur1NavShiftLock")
+			lockRelease()
+		end)
+	end
+
+	-- ═══ state ═══════════════════════════════════════════════════════════════════════════════
+	local S = {
+		-- planner
+		path = nil, idx = 1, goal = nil, planAt = 0, planning = false, token = 0, retryAt = 0, failures = 0,
+		stations = nil, stIdx = 1, stGoal = nil, stSince = 0, lastDoor = nil,
+		blockedConn = nil, pathObj = nil, wpIdx = nil, wpAt = 0, forceGridUntil = 0,
+		bad = {}, badCount = 0, doorFail = {},
+		-- movement / recovery
+		stuck = 0, stuckLevel = 0, calm = 0, lastPos = nil, lastStepAt = 0,
+		recoverPoint = nil, recoverUntil = 0, sideDir = 1, hist = {}, histAt = 0,
+		direct = nil, climbing = nil, lostSince = nil,
+		-- owner trail replay
+		tr = nil, trailBlock = 0, trailChk = 0, trCheck = 0,
+	}
+	local scanCache, scanCount = {}, 0
+
+	-- planners never use more than ~4 ms per frame
+	local sliceT = 0
+	local function cancelled(token)
+		if os.clock() - sliceT > 0.004 then
+			task.wait()
+			sliceT = os.clock()
+		end
+		return token ~= S.token or not B.running
+	end
+
+	-- ═══ rooms and exits ═════════════════════════════════════════════════════════════════════
 	local function fan(origin, n, range)
 		local rays = table.create(n)
 		for i = 0, n - 1 do
@@ -214,7 +252,7 @@ return function(B)
 		return res
 	end
 
-	-- cheap coarse scan first; the full scan only runs when it already looks room-like
+	-- cheap coarse scan first; the full 360 scan only when the coarse one already looks room-like
 	local function analyze(origin, fresh)
 		local now = os.clock()
 		local ck = cell2(origin, 4)
@@ -259,9 +297,7 @@ return function(B)
 					if width >= C.NAV_DOOR_MIN then
 						local mid = rays[(start - 1 + i + floor((len - 1) / 2)) % N + 1]
 						local pos = origin + mid.dir * ((ra.dist + rb.dist) / 2)
-						exits[#exits + 1] = {
-							pos = pos, width = width, outer = pos + mid.dir * 7, key = dkey(pos),
-						}
+						exits[#exits + 1] = {pos = pos, width = width, outer = pos + mid.dir * 7, key = dkey(pos)}
 					end
 					i += len
 				else
@@ -290,7 +326,7 @@ return function(B)
 		return groundBelow(p.X, p.Z, p.Y + 4, 30) or p
 	end
 
-	-- ═══ ladders (list is built once, then kept current by events) ═══
+	-- ═══ ladders (set built once, kept current by events) ════════════════════════════════════
 	local trussSet, trussReady = {}, false
 	local function trusses()
 		if not trussReady then
@@ -308,17 +344,18 @@ return function(B)
 		return trussSet
 	end
 
+	-- best ladder to get from feet to goalFeet. returns a station {pos, key, climb = {...}} or nil
 	local function findClimb(feet, goalFeet)
 		local up = goalFeet.Y > feet.Y
 		local best, bs
 		for t in pairs(trusses()) do
 			local sz = t.Size
-			if sz.Y >= sz.X and sz.Y >= sz.Z then
+			if sz.Y >= sz.X and sz.Y >= sz.Z then -- vertical ladders only
 				local half = V3(0, sz.Y / 2, 0)
 				local enter, exit = t.Position - half, t.Position + half
 				if not up then enter, exit = exit, enter end
-				local heightErr = math.abs(exit.Y - goalFeet.Y)
-				if heightErr < math.abs(feet.Y - goalFeet.Y) - 3 then
+				local heightErr = abs(exit.Y - goalFeet.Y)
+				if heightErr < abs(feet.Y - goalFeet.Y) - 3 then
 					local sc = flatDist(feet, enter) + flatDist(exit, goalFeet) + heightErr * 2
 						+ (S.doorFail["t" .. dkey(t.Position)] or 0) * 60
 					if not bs or sc < bs then best, bs = {t = t, enter = enter, exit = exit}, sc end
@@ -340,15 +377,14 @@ return function(B)
 		}
 	end
 
-	-- route through real exits (leave our room, enter the goal's room); ladder first on different floors
+	-- route stations: ladder first on different floors, otherwise through the real exits of the rooms
 	local function computeStations(feet, goalFeet)
-		local list, cur = {}, feet
-
-		if math.abs(goalFeet.Y - feet.Y) > C.NAV_VERT_MIN then
+		if abs(goalFeet.Y - feet.Y) > C.NAV_VERT_MIN then
 			local climb = findClimb(feet, goalFeet)
 			if climb then return {climb} end
 		end
 
+		local list, cur = {}, feet
 		local function bestExit(an, score)
 			local best, bs
 			for _, e in ipairs(an.exits) do
@@ -384,7 +420,7 @@ return function(B)
 		return list
 	end
 
-	-- ═══ planners ═══
+	-- ═══ planners ════════════════════════════════════════════════════════════════════════════
 	local function heapPush(h, item)
 		local n = #h + 1
 		h[n] = item
@@ -430,7 +466,7 @@ return function(B)
 			return ((ix + 8192) * 16384 + (iz + 8192)) * 128 + (clamp(floor(y / 8 + 0.5), -60, 60) + 64)
 		end
 		local function h(p)
-			return flatDist(p, target) + math.abs(p.Y - target.Y) * 0.5
+			return flatDist(p, target) + abs(p.Y - target.Y) * 0.5
 		end
 
 		local sx, sz = floor(feet.X / G), floor(feet.Z / G)
@@ -460,7 +496,7 @@ return function(B)
 				local hv = h(node.pos)
 				if hv < bestH then best, bestH = node, hv end
 
-				if flatDist(node.pos, target) < G * 3.2 and math.abs(node.pos.Y - target.Y) < 8
+				if flatDist(node.pos, target) < G * 3.2 and abs(node.pos.Y - target.Y) < 8
 					and probe(node.pos, target, 1.2) then
 					return finish(node, target), "full"
 				end
@@ -571,7 +607,208 @@ return function(B)
 		return out
 	end
 
-	-- ═══ state helpers ═══
+	-- ═══ owner trail: record ═════════════════════════════════════════════════════════════════
+	-- sample = {p = feet position, air, climb, takeoff, land, sig, n}
+	--   takeoff = last grounded sample before leaving the ground     land = first grounded sample after
+	--   sig     = on a take-off whose jump was a REAL one (gap / height change) or on the first climbing sample
+	local T = {pts = {}, nextN = 1, owner = nil, at = 0, take = nil}
+
+	local function pushSample(s)
+		local pts = T.pts
+		s.n = T.nextN
+		T.nextN += 1
+		pts[#pts + 1] = s
+		if #pts > C.NAV_TRAIL_MAX then table.remove(pts, 1) end
+	end
+
+	local function record()
+		local owner = B.ownerPlayer and B.ownerPlayer()
+		if owner ~= T.owner then
+			T.owner, T.take = owner, nil
+			table.clear(T.pts)
+		end
+		local hum, root = getParts(owner)
+		if not (hum and root) then return end
+
+		local feet = root.Position - HIPV
+		local climb = hum:GetState() == Enum.HumanoidStateType.Climbing
+		local air = (not climb) and hum.FloorMaterial == Enum.Material.Air
+
+		local pts = T.pts
+		local last = pts[#pts]
+		if last then
+			local d = (feet - last.p).Magnitude
+			if d > 70 then -- teleport: the old path no longer leads here
+				table.clear(pts)
+				T.take, last = nil, nil
+			elseif air == last.air and climb == last.climb and d < (air and 2.5 or 1.2) then
+				return
+			end
+		end
+
+		local s = {p = feet, air = air, climb = climb}
+		if last then
+			if air and not last.air and not climb then
+				last.takeoff = true
+				T.take = last
+			elseif (not air) and last.air then
+				s.land = true
+				local tk = T.take
+				T.take = nil
+				if tk then
+					local ok = probe(tk.p, feet, 1.2)
+					if (not ok) or abs(feet.Y - tk.p.Y) >= 3 then tk.sig = true end
+				end
+			end
+			if climb and not last.climb then s.sig = true end
+		end
+		pushSample(s)
+	end
+
+	table.insert(B.conns, RunService.Heartbeat:Connect(function()
+		if not (B.running and C.NAV_TRAIL) then return end
+		local now = os.clock()
+		if now - T.at < 0.05 then return end
+		T.at = now
+		pcall(record)
+	end))
+
+	-- ═══ owner trail: replay ═════════════════════════════════════════════════════════════════
+	-- nearest recorded sample to `feet` (height counts 1.5x so stacked sections don't get mixed up)
+	local function anchorFor(feet)
+		local pts, best, bd = T.pts, nil, C.NAV_TRAIL_REACH
+		for i = #pts, 1, -1 do
+			local p = pts[i].p
+			local dx, dy, dz = p.X - feet.X, (p.Y - feet.Y) * 1.5, p.Z - feet.Z
+			local d = sqrt(dx * dx + dy * dy + dz * dz)
+			if d < bd then best, bd = i, d end
+		end
+		return best
+	end
+
+	-- is there a real jump / climb between sample index `a` and the owner?
+	local function hardAhead(a)
+		local pts = T.pts
+		for i = math.max(a, 1), #pts do
+			if pts[i].sig then return true end
+		end
+		return false
+	end
+
+	local function tryStartTrail(feet, goalFeet, now)
+		if not C.NAV_TRAIL or now < S.trailBlock or now - S.trailChk < 0.2 then return false end
+		S.trailChk = now
+		local pts = T.pts
+		local n = #pts
+		if n < 3 then return false end
+		if nearDist(goalFeet, pts[n].p) > 18 then return false end -- only when the goal is the owner
+		local a = anchorFor(feet)
+		if not a or a >= n - 1 then return false end
+		if not (hardAhead(a) or abs(goalFeet.Y - feet.Y) > C.NAV_VERT_MIN or S.failures >= 2) then return false end
+		S.tr = {n = pts[a].n, prog = now, lastIdx = -1, tries = 0}
+		return true
+	end
+
+	-- aim a few studs ahead along flat grounded samples (never past a take-off / air / climb sample)
+	local function lookAhead(idx, n)
+		local pts = T.pts
+		local cur = pts[idx]
+		if cur.air or cur.climb or cur.takeoff then return cur end
+		local aim, acc, j = cur, 0, idx
+		while j < n do
+			local nx = pts[j + 1]
+			if nx.air or nx.climb then break end
+			acc += (nx.p - pts[j].p).Magnitude
+			if acc > 3.5 then break end
+			aim, j = nx, j + 1
+			if nx.takeoff then break end
+		end
+		return aim
+	end
+
+	local function endTrail(now, block)
+		S.tr = nil
+		if block then S.trailBlock = now + block end
+	end
+
+	-- returns the root-level point to MoveTo, or nil when the replay is over / failed
+	local function followTrail(feet, hum, root, now)
+		local tr, pts = S.tr, T.pts
+		local n = #pts
+		if n == 0 then endTrail(now); return nil end
+
+		local idx = clamp(tr.n - pts[1].n + 1, 1, n)
+		local cur = pts[idx]
+		local air = hum.FloorMaterial == Enum.Material.Air and hum:GetState() ~= Enum.HumanoidStateType.Climbing
+		local vel = root.AssemblyLinearVelocity
+		local speed = sqrt(vel.X * vel.X + vel.Z * vel.Z)
+
+		-- fell off / lost the path: rejoin at the nearest recorded point, give up after a few tries
+		if not air and (feet.Y < cur.p.Y - 12 or flatDist(feet, cur.p) > 30) then
+			tr.tries += 1
+			local a = anchorFor(feet)
+			if not a or tr.tries > 3 then endTrail(now, 4); return nil end
+			idx, cur = a, pts[a]
+		end
+
+		-- reach the points in order. A take-off point is only "reached" very close (the jump must start at
+		-- the same spot the owner jumped from, or the gap is lost), or once we ran past it.
+		for _ = 1, 4 do
+			if idx >= n then break end
+			local fd = flatDist(feet, cur.p)
+			local dy = abs(feet.Y - cur.p.Y)
+			local reached
+			if cur.takeoff then
+				local nx = pts[idx + 1]
+				local fwd = nx and V3(nx.p.X - cur.p.X, 0, nx.p.Z - cur.p.Z)
+				local passed = fwd and fwd.Magnitude > 0.1 and fd < 3
+					and (V3(feet.X - cur.p.X, 0, feet.Z - cur.p.Z)):Dot(fwd.Unit) > 0
+				reached = (not air) and dy < 3.5 and (fd < math.max(0.9, speed * 0.05 + 0.3) or passed)
+				if reached then jump(hum) end
+			elseif cur.air then
+				reached = fd < 3.5
+			elseif cur.climb then
+				reached = fd < 2.5 and dy < 2.5
+			else
+				reached = fd < 2.2 and dy < 3.5
+			end
+			if not reached then break end
+			idx += 1
+			cur = pts[idx]
+		end
+
+		-- progress watchdog
+		if idx ~= tr.lastIdx then tr.lastIdx, tr.prog = idx, now end
+		if not air then
+			if now - tr.prog > 1 then jump(hum) end
+			if now - tr.prog > 2.5 then
+				tr.tries += 1
+				tr.prog = now
+				local a = anchorFor(feet)
+				if not a or tr.tries > 3 then endTrail(now, 4); return nil end
+				idx, cur = a, pts[a]
+			end
+		end
+
+		-- caught up with the owner
+		if idx >= n and nearDist(feet, cur.p) < 3 then endTrail(now); return nil end
+
+		tr.n = cur.n
+		local aim
+		if air then
+			-- in the air: fly toward where the owner landed
+			aim = cur
+			for j = idx, n do
+				if not pts[j].air then aim = pts[j]; break end
+				aim = pts[j]
+			end
+		else
+			aim = lookAhead(idx, n)
+		end
+		return aim.p + HIPV
+	end
+
+	-- ═══ planner state helpers ═══════════════════════════════════════════════════════════════
 	local function invalidate()
 		S.path, S.idx, S.retryAt, S.wpIdx = nil, 1, 0, nil
 		S.token += 1
@@ -606,7 +843,7 @@ return function(B)
 		task.spawn(function()
 			local ok, err = pcall(function()
 				local feet = rootPos - HIPV
-				local goalFeet = feetOf(goalRoot)
+				local goalFeet = goalFeetOf(goalRoot)
 
 				if S.stations == nil or (S.stGoal and flatDist(S.stGoal, goalFeet) > 12) then
 					S.stations = computeStations(feet, goalFeet)
@@ -652,7 +889,7 @@ return function(B)
 		end)
 	end
 
-	-- ═══ moving ═══
+	-- ═══ movement helpers ════════════════════════════════════════════════════════════════════
 	local function applySep(pos, pt, goal)
 		if flatDist(pos, goal) <= 3 then return pt end
 		local sd = B.tight and C.TIGHT_SEP or C.SEPARATION_DIST
@@ -696,7 +933,7 @@ return function(B)
 			if dist > bestD + 1 then best, bestD = v, dist end
 		end
 		if best then
-			lockFace(dir, 0.4) -- slide around the obstacle without turning away from the goal
+			lockFace(dir, 0.4)
 			return feet + best * math.max(look, 4)
 		end
 		return point
@@ -710,7 +947,7 @@ return function(B)
 		if cast(feet + LOW, dir * 3) and not cast(feet + HIGH, dir * 3) then jump(hum) end
 	end
 
-	-- escalating recovery: side-step -> back-track -> escape opening -> force grid planner
+	-- escalating recovery when the bot stops moving: side-step -> back-track -> escape -> force grid
 	local function escalate(feet, aim, hum, now)
 		S.stuckLevel += 1
 		S.calm = 0
@@ -754,7 +991,7 @@ return function(B)
 		else
 			S.forceGridUntil = now + 8
 		end
-		if lvl <= 2 then lockFace(d, 1.2) end -- side-step / back-track while still facing the goal
+		if lvl <= 2 then lockFace(d, 1.2) end
 		jump(hum)
 	end
 
@@ -768,6 +1005,7 @@ return function(B)
 		return ok
 	end
 
+	-- ladder driving. returns the point to MoveTo, or nil when the climb is over
 	local function climbStep(feet, now)
 		local cl = S.climbing
 		local t = cl.truss
@@ -778,7 +1016,7 @@ return function(B)
 			return nil
 		end
 
-		if math.abs(feet.Y - cl.exit.Y) < 2.5 then
+		if abs(feet.Y - cl.exit.Y) < 2.5 then
 			if cl.topAt == math.huge then cl.topAt = now end
 			if now - cl.topAt > 0.4 then
 				S.climbing, S.stations = nil, nil
@@ -795,122 +1033,29 @@ return function(B)
 		return V3(tp.X, targetY + C.NAV_HIP, tp.Z)
 	end
 
-	-- ═══ owner trail (obbies, gaps, parkour) ═══
-	-- The owner's real path is recorded (position, in-air flag, take-off points). When walking / pathfinding can't
-	-- reach the owner and the trail shows jumps or big height changes, the bot REPLAYS the owner's path and jumps
-	-- where the owner jumped, instead of searching for a ladder or a walkable route that doesn't exist.
-	local T = {pts = {}, nextN = 1, player = nil, lastAt = 0}
-
-	local function trailAdd(feet, air)
-		local pts = T.pts
-		local last = pts[#pts]
-		if last and (feet - last.pos).Magnitude > 60 then table.clear(pts); last = nil end -- teleport
-		if last and air == last.air and (feet - last.pos).Magnitude < 1.5 then return end
-		if air and last and not last.air then last.jump = true end -- last grounded sample = take-off point
-		pts[#pts + 1] = {pos = feet, air = air, jump = false, n = T.nextN}
-		T.nextN += 1
-		if #pts > 400 then table.remove(pts, 1) end
-	end
-
-	table.insert(B.conns, game:GetService("RunService").Heartbeat:Connect(function()
-		if not (B.running and C.NAV_TRAIL) then return end
-		local now = os.clock()
-		if now - T.lastAt < 0.08 then return end
-		T.lastAt = now
-		local owner = B.ownerPlayer and B.ownerPlayer()
-		if owner ~= T.player then T.player = owner; table.clear(T.pts) end
-		local hum, root = getParts(owner)
-		if hum and root then
-			trailAdd(root.Position - HIPV, hum.FloorMaterial == Enum.Material.Air)
-		end
-	end))
-
-	-- nearest recorded sample to the bot (newest wins ties), nil when none is within 25 studs
-	local function trailAnchor(feet)
-		local pts, best, bd = T.pts, nil, 25
-		for i = #pts, 1, -1 do
-			local d = (pts[i].pos - feet).Magnitude
-			if d < bd then best, bd = i, d end
-		end
-		return best
-	end
-
-	local function useTrail(feet, goalFeet, now)
-		if not C.NAV_TRAIL or now < S.trailBlock or now - S.trailChk < 0.25 then return false end
-		S.trailChk = now
-		local pts = T.pts
-		local n = #pts
-		if n < 3 or flatDist(goalFeet, pts[n].pos) > 25 then return false end -- only when the goal is the owner
-		local a = trailAnchor(feet)
-		if not a or a >= n - 1 then return false end
-		local needs = S.failures >= 2 or math.abs(goalFeet.Y - feet.Y) > C.NAV_VERT_MIN
-		if not needs then
-			for i = a, n do
-				if pts[i].air or pts[i].jump then needs = true; break end
-			end
-		end
-		if not needs then return false end
-		S.trail = {n = (flatDist(feet, pts[a].pos) < 2.5 and pts[a + 1] or pts[a]).n}
-		return true
-	end
-
-	-- returns the root-level point to MoveTo, or nil when the trail is finished / lost
-	local function followTrail(feet, hum, now)
-		local tr, pts = S.trail, T.pts
-		if #pts == 0 then S.trail = nil; return nil end
-		local i = math.clamp(tr.n - pts[1].n + 1, 1, #pts)
-		local cur = pts[i]
-
-		-- fell off / lost the trail: re-acquire, otherwise hand back to the normal planner
-		if feet.Y < cur.pos.Y - 14 or flatDist(feet, cur.pos) > 35 then
-			local a = trailAnchor(feet)
-			if not a then S.trail, S.trailBlock = nil, now + 3; return nil end
-			i, cur = a, pts[a]
-		end
-
-		-- overshoot: a later grounded sample is already under our feet (never skips a take-off point)
-		for k = math.min(#pts, i + 3), i + 1, -1 do
-			local s = pts[k]
-			if not s.air and flatDist(feet, s.pos) < 2.2 and math.abs(feet.Y - s.pos.Y) < 3 then
-				local clean = true
-				for m = i, k - 1 do
-					if pts[m].jump then clean = false; break end
-				end
-				if clean then i, cur = k, s; break end
-			end
-		end
-
-		local reach = cur.air and 3.5 or 2.2
-		if flatDist(feet, cur.pos) < reach and (cur.air or math.abs(feet.Y - cur.pos.Y) < 5) then
-			if cur.jump then jump(hum) end
-			if i >= #pts then S.trail = nil; return nil end -- caught up with the owner
-			i += 1
-			cur = pts[i]
-		end
-		tr.n = cur.n
-
-		if cur.jump and flatDist(feet, cur.pos) < 3 then jump(hum) end
-		return cur.pos + HIPV
-	end
-
-	-- ═══ the step the main script calls ═══
+	-- ═══ the step the main script calls ══════════════════════════════════════════════════════
+	-- returns the point to MoveTo, and true when the way to the goal is a clean straight line
 	local function step(goalRoot, dt, alt)
 		local hum, root = getParts(lp)
 		if not (hum and root) then return goalRoot, true end
 		local now = os.clock()
 		dt = dt or 0.05
 		local rootPos = root.Position
-		local feet, goalFeet = rootPos - HIPV, goalRoot - HIPV
+		local feet = rootPos - HIPV
+		local goalFeet = goalFeetOf(goalRoot)
+		local air = hum.FloorMaterial == Enum.Material.Air
 
+		-- not called for a while (bot was holding still): forget the stuck counters
 		if now - S.lastStepAt > 0.5 then
 			S.stuck, S.lastPos, S.recoverPoint = 0, nil, nil
 		end
 		S.lastStepAt = now
 
+		-- on a (planned) ladder: nothing else matters until the climb is done
 		if S.climbing then
 			S.stuck, S.lastPos = 0, nil
 			local p = climbStep(feet, now)
-			if p then return p, false end
+			if p then B.navTrail = false; return p, false end
 		end
 
 		if now - S.histAt > 0.5 then
@@ -919,8 +1064,10 @@ return function(B)
 			if #S.hist > 8 then table.remove(S.hist, 1) end
 		end
 
-		-- stuck detection (reacts a bit sooner than before)
-		if S.lastPos and (feet - S.lastPos).Magnitude < 0.2 then
+		-- stuck detection (the trail replay has its own watchdog)
+		if air or S.tr then
+			S.stuck = 0
+		elseif S.lastPos and (feet - S.lastPos).Magnitude < 0.2 then
 			S.stuck += dt
 		else
 			S.stuck = 0
@@ -931,33 +1078,55 @@ return function(B)
 		if S.stuck > 0.35 then jump(hum) end
 		if S.stuck > 0.7 then
 			S.stuck = 0
-			if S.trail then
-				jump(hum) -- replaying the owner's path: just hop, never side-step off a platform
-			else
-				local tgt = S.stations and S.stations[S.stIdx]
-				escalate(feet, tgt and tgt.pos or goalFeet, hum, now)
+			local tgt = S.stations and S.stations[S.stIdx]
+			escalate(feet, tgt and tgt.pos or goalFeet, hum, now)
+		end
+		if S.recoverPoint and now < S.recoverUntil then B.navTrail = false; return S.recoverPoint, false end
+
+		-- 1. OWNER TRAIL: obbies, gaps, climbs, other levels -> replay the owner's real path
+		if S.tr then
+			-- walked past every hard part and the way is open again: back to normal walking
+			if not air and now - S.trCheck > 0.3 then
+				S.trCheck = now
+				local idx = clamp(S.tr.n - (T.pts[1] and T.pts[1].n or 0) + 1, 1, math.max(#T.pts, 1))
+				if not hardAhead(idx) and abs(goalFeet.Y - feet.Y) <= C.NAV_Y_TOL
+					and directClear(feet, goalFeet, now) then
+					endTrail(now)
+				end
+			end
+		elseif not air then
+			tryStartTrail(feet, goalFeet, now)
+		end
+		if S.tr then
+			local p = followTrail(feet, hum, root, now)
+			if p then
+				if S.path or S.stations then
+					invalidate()
+					S.stations = nil
+				end
+				S.lostSince = nil
+				B.navTrail, B.navLost = true, false
+				return p, false -- no separation push / lanes here: they could shove the bot off a platform
 			end
 		end
-		if S.recoverPoint and now < S.recoverUntil then return S.recoverPoint, false end
+		B.navTrail = false
 
-		-- stations (doors / ladders)
+		-- stations (doors and ladders)
 		local st = S.stations and S.stations[S.stIdx]
 		if st then
-			if flatDist(feet, st.pos) < 2.6 and math.abs(feet.Y - st.pos.Y) < 6 then
+			if nearDist(feet, st.pos) < 2.6 then
+				S.stIdx += 1
+				S.stSince = now
 				if st.climb then
 					S.climbing = {
 						truss = st.climb.truss, exit = st.climb.exit, up = st.climb.up,
 						key = st.key, since = now, topAt = math.huge,
 					}
-					S.stIdx += 1
-					S.stSince = now
 					invalidate()
 					local p = climbStep(feet, now)
 					if p then return p, false end
 					st = S.stations and S.stations[S.stIdx]
 				else
-					S.stIdx += 1
-					S.stSince = now
 					invalidate()
 					st = S.stations[S.stIdx]
 				end
@@ -968,29 +1137,18 @@ return function(B)
 			end
 		end
 
-		-- 1. direct
+		-- 2. DIRECT (height-aware: groundOK rejects a goal on another level unless a ramp / stairs leads there)
 		if directClear(feet, goalFeet, now) then
 			if S.path or S.stations then
 				invalidate()
 				S.stations = nil
 			end
+			S.lostSince, B.navLost = nil, false
 			autoJump(hum, feet, goalRoot)
 			return applySep(rootPos, goalRoot, goalRoot), true
 		end
 
-		-- 1b. owner trail (obbies / gaps): follow where the owner went instead of looking for a ladder
-		if S.trail or useTrail(feet, goalFeet, now) then
-			local tp = followTrail(feet, hum, now)
-			if tp then
-				if S.path or S.stations then
-					invalidate()
-					S.stations = nil
-				end
-				return tp, false -- no separation push here: it could shove a bot off a platform
-			end
-		end
-
-		-- 2. plan
+		-- 3. PLAN (stations + Roblox + grid A*)
 		if not S.planning then
 			local need
 			if not S.path then
@@ -1003,17 +1161,21 @@ return function(B)
 
 		local p = S.path
 		if not p or #p == 0 then
+			-- unreachable for a while: tell the main script (it teleports the bot to the owner)
+			S.lostSince = S.lostSince or now
+			if now - S.lostSince > 4 and nearDist(feet, goalFeet) > 12 then B.navLost = true end
 			local out = steer(feet, st and st.pos or goalFeet)
 			autoJump(hum, feet, out)
 			return applySep(rootPos, out, goalRoot), false
 		end
+		S.lostSince, B.navLost = nil, false
 
-		-- 3. follow
+		-- 4. FOLLOW the path
 		S.idx = math.min(S.idx, #p)
-		while S.idx < #p and flatDist(feet, p[S.idx].pos) < 2.8 and math.abs(feet.Y - p[S.idx].pos.Y) < 6 do
+		while S.idx < #p and flatDist(feet, p[S.idx].pos) < 2.8 and abs(feet.Y - p[S.idx].pos.Y) < 5 do
 			S.idx += 1
 		end
-		if S.idx >= #p and flatDist(feet, p[#p].pos) < 2.4 then
+		if S.idx >= #p and nearDist(feet, p[#p].pos) < 2.4 then
 			S.path = nil
 			S.retryAt = now + 0.2
 			if st then
@@ -1069,8 +1231,9 @@ return function(B)
 		return applySep(rootPos, out, goalRoot), false
 	end
 
-	-- ═══ install ═══
+	-- ═══ install ═════════════════════════════════════════════════════════════════════════════
 	B.navStep = step
+	B.nearDist = nearDist
 	B.lineClear = function(a, b, wide)
 		local ok, nj = probe(a - HIPV, b - HIPV, wide and 1.5 or 0.6)
 		return ok and not nj
@@ -1078,14 +1241,17 @@ return function(B)
 	B.analyze = function(p) return analyze(p - HIPV) end
 	B.navReset = function()
 		invalidate()
-		S.stations, S.stuck, S.stuckLevel, S.climbing, S.trail = nil, 0, 0, nil, nil
+		S.stations, S.stuck, S.stuckLevel, S.climbing, S.tr = nil, 0, 0, nil, nil
+		S.lostSince, B.navLost, B.navTrail = nil, false, false
 	end
+	B.navTrail, B.navLost = false, false
 
 	table.insert(B.restores, function()
 		S.token += 1
 		if S.blockedConn then pcall(function() S.blockedConn:Disconnect() end) end
-		B.navStep, B.lineClear, B.analyze, B.navReset = nil, nil, nil, nil
+		B.navStep, B.nearDist, B.lineClear, B.analyze, B.navReset = nil, nil, nil, nil, nil
+		B.navTrail, B.navLost = nil, nil
 	end)
 
-	print("[yur1] nav module active")
+	print("[yur1] nav module active (owner-trail obbies, height-aware, rooms, ladders, A*)")
 end
