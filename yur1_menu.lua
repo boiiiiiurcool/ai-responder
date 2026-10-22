@@ -1,10 +1,12 @@
--- yur1_menu.lua  (owner menu: Accounts tab + Settings tab)
+-- yur1_menu.lua  (owner menu: Accounts tab + Settings tab + Lists tab + Logs tab)
 -- Loaded by yur1.lua. Called as  menu = ctor(U)  and returns { root = Frame, refresh = function(data) }
 --
--- Top right:     "x / y running" counter + Sign out (click twice: everybody goes back to the Owner / Alt screen)
--- Settings tab:  Chat / Kill lines / Dancing / AI chat switches
+-- Top right:     "x/y on" counter + Sign out (click twice: everybody goes back to the Owner / Alt screen)
+-- Settings tab:  Chat / Kill lines / Dancing / AI chat / Carry mode switches
 --                Hide key  (click it, then press the combo you want: Ctrl / Shift / Alt / Win + a key, Esc = cancel)
 --                Unload    (click twice: unloads EVERY account, alts included)
+-- Lists tab:     Whitelist / Blacklist
+-- Logs tab:      the debug log (colored by level, filter / clear / copy) built by U.buildLog
 
 return function(U)
 	local Players = game:GetService("Players")
@@ -36,7 +38,7 @@ return function(U)
 	local function makeTab(text, x)
 		local b = Instance.new("TextButton")
 		b.Position = UDim2.fromOffset(x, 12)
-		b.Size = UDim2.fromOffset(96, 26)
+		b.Size = UDim2.fromOffset(76, 26)
 		b.BackgroundColor3 = PANEL_COLOR
 		b.AutoButtonColor = false
 		b.Font = Enum.Font.GothamMedium
@@ -49,14 +51,15 @@ return function(U)
 	end
 
 	local accountsTab, accountsTabStroke = makeTab("Accounts", 16)
-	local settingsTab, settingsTabStroke = makeTab("Settings", 118)
-	local listsTab, listsTabStroke = makeTab("Lists", 220)
+	local settingsTab, settingsTabStroke = makeTab("Settings", 96)
+	local listsTab, listsTabStroke = makeTab("Lists", 176)
+	local logsTab, logsTabStroke = makeTab("Logs", 256)
 
-	-- "x / y running" sits left of the Sign out button
+	-- "x/y on" sits left of the Sign out button
 	local summary = Instance.new("TextLabel")
 	summary.BackgroundTransparency = 1
-	summary.Position = UDim2.new(1, -240, 0, 12)
-	summary.Size = UDim2.fromOffset(120, 26)
+	summary.Position = UDim2.new(1, -200, 0, 12)
+	summary.Size = UDim2.fromOffset(88, 26)
 	summary.Font = Enum.Font.Gotham
 	summary.Text = ""
 	summary.TextColor3 = DIM_TEXT
@@ -86,11 +89,27 @@ return function(U)
 	settingsPage.Parent = root
 	local listsPage = makePage()
 
+	-- logs page: the log viewer built by the main script (colored debug log instead of the console)
+	local logsPage = makePage()
+	if U.buildLog then
+		U.buildLog(logsPage, UDim2.fromScale(0, 0), UDim2.fromScale(1, 1))
+	else
+		local missing = Instance.new("TextLabel")
+		missing.BackgroundTransparency = 1
+		missing.Size = UDim2.new(1, 0, 0, 20)
+		missing.Font = Enum.Font.Gotham
+		missing.Text = "Log viewer not available"
+		missing.TextColor3 = DIM_TEXT
+		missing.TextSize = 13
+		missing.Parent = logsPage
+	end
+
 	local function showTab(name)
 		local tabs = {
 			accounts = {accountsTab, accountsTabStroke, accountsPage},
 			settings = {settingsTab, settingsTabStroke, settingsPage},
 			lists = {listsTab, listsTabStroke, listsPage},
+			logs = {logsTab, logsTabStroke, logsPage},
 		}
 		for key, t in pairs(tabs) do
 			local on = (key == name)
@@ -103,6 +122,7 @@ return function(U)
 	accountsTab.Activated:Connect(function() showTab("accounts") end)
 	settingsTab.Activated:Connect(function() showTab("settings") end)
 	listsTab.Activated:Connect(function() showTab("lists") end)
+	logsTab.Activated:Connect(function() showTab("logs") end)
 
 	local function smallButton(parent, text, pos, size)
 		local b = Instance.new("TextButton")
@@ -417,6 +437,7 @@ return function(U)
 		accountsPage.Size = UDim2.new(1, -32 - extra, 1, -68)
 		settingsPage.Size = UDim2.new(1, -32 - extra, 1, -68)
 		listsPage.Size = UDim2.new(1, -32 - extra, 1, -68)
+		logsPage.Size = UDim2.new(1, -32 - extra, 1, -68)
 		if U.setSideWidth then U.setSideWidth(open and SIDE_EXTRA or 0) end
 	end
 
@@ -678,7 +699,7 @@ return function(U)
 		end
 		currentAlts = alts
 		if panelOpen then task.defer(function() pcall(m.updateInfo) end) end
-		summary.Text = runningCount .. " / " .. #alts .. " running"
+		summary.Text = runningCount .. "/" .. #alts .. " on"
 		local hasSub = control.subOwner ~= ""
 		local subHere = hasSub and findServerPlayer(control.subOwner) ~= nil
 		emptyLabel.Visible = (#alts == 0 and not hasSub)
@@ -864,6 +885,7 @@ return function(U)
 			control.settings[key] = not control.settings[key]
 			set(control.settings[key], true)
 			pushControl()
+			if U.log then U.log("debug", "[menu] setting '" .. key .. "' = " .. tostring(control.settings[key])) end
 		end)
 
 		switches[key] = set
@@ -1094,5 +1116,6 @@ return function(U)
 	end
 
 	showTab("accounts")
+	if U.log then U.log("success", "[menu] owner menu ready") end
 	return m
 end
