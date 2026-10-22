@@ -1,33 +1,9 @@
 --[[
-    yur1_nav.lua  -  advanced pathfinding module for yur1
+    yur1_nav.lua - pathfinding module (cleaned + optimized)
+    Installs: B.navStep(goal, dt, alt) -> point, direct | B.lineClear(a, b, wide) | B.analyze(pos) | B.navReset()
 
-    Loaded by the main script like the other modules (returns function(B)). It installs:
-      B.navStep(goal, dt, alt) -> movePoint, direct     (used by the follow / fight / shop loops)
-      B.lineClear(a, b, wide)  -> bool                  (multi-ray, multi-height clear check)
-      B.analyze(pos)           -> room / exit scan      (other modules can use it)
-      B.navReset()
-
-    HOW IT WORKS (in order, each step only runs if the one before it can't solve it)
-      0. LADDERS     goal more than NAV_VERT_MIN studs above/below us (and not directly reachable):
-                     pick the best TrussPart ladder, walk to its foot, climb, then re-plan on the new floor.
-                     Stairs / ramps are handled by Roblox pathfinding and the grid A* below.
-      1. DIRECT      multi-ray body probe (knee / head height, centre + both sides) + ground samples
-                     (gaps, cliffs, big drops). Low obstacles you can hop over are detected separately.
-      2. ROOMS       a cheap coarse scan runs first; only when it looks room-like the full 360 degree fan runs.
-                     If the goal is inside a room (or we are), the route is forced through a real exit:
-                       - dead-end room with ONE exit  -> that exit is the only choice
-                       - several exits                -> cheapest exit, exits that failed before are penalised
-                     The route becomes "stations": exit -> outside point -> ... -> goal.
-                     Room logic only runs when both ends are on the same floor.
-      3. ROBLOX      PathfindingService with several agent radii + alternate targets.
-      4. GRID A*     our own raycast A* (budgeted over many frames) when Roblox fails or after being stuck:
-                     wall-clearance costs, jump costs, bad-cell memory, partial paths when the goal is walled off.
-      5. SMOOTHING   string-pulling with the multi-ray probe so the bot cuts corners instead of zig-zagging.
-      6. FOLLOWING   look-ahead along the path, auto-hop over low obstacles, whisker steering around
-                     things that appear (doors, props), lane offsets + separation for several bots.
-                     In tight spaces (B.tight) lanes are off and the separation radius is small.
-      7. RECOVERY    escalating stuck handling: hop -> side-step -> back-track -> escape through the biggest
-                     opening toward the goal -> force grid planner. Stuck spots are remembered as "bad".
+    Order of attempts: ladder -> direct probe -> room exits -> Roblox pathfinding -> grid A* -> smoothing
+    -> following (look-ahead, hop, whiskers, lanes) -> escalating stuck recovery.
 ]]
 
 return function(B)
@@ -38,52 +14,99 @@ return function(B)
 	local getParts, flatDist, jump = B.getParts, B.flatDist, B.jump
 	local isBot = B.isBot or function() return false end
 
-	local function def(k, v) if C[k] == nil then C[k] = v end end
-	def("NAV_HIP", 3)            -- root part height above the floor
-	def("NAV_FAN_RAYS", 32)      -- rays in the full 360 degree room scan
-	def("NAV_COARSE_RAYS", 10)   -- rays in the cheap first scan
-	def("NAV_FAN_RANGE", 40)     -- scan distance
-	def("NAV_ROOM_RADIUS", 26)   -- a place counts as "room" when most rays hit a wall closer than this
-	def("NAV_ROOM_CLOSED", 0.7)  -- fraction of rays that must be short for a room
-	def("NAV_OPEN_MIN", 12)      -- a ray must reach at least this far to count as an opening
-	def("NAV_DOOR_MIN", 2.5)     -- opening width limits that count as a doorway
-	def("NAV_DOOR_MAX", 14)
-	def("NAV_VERT_MIN", 7)       -- height difference that triggers a ladder search
-	def("NAV_GRID", 3)           -- A* cell size (studs)
-	def("NAV_GRID_MAX", 1200)    -- max A* node expansions per search
-	def("NAV_GRID_TIME", 4)      -- max seconds per A* search
-	def("NAV_SLICE", 10)         -- A* expansions per frame
-	def("NAV_SMOOTH_LOOK", 8)    -- how far ahead the smoother looks
-	def("NAV_STATION_TIME", 16)  -- give up on a door station after this many seconds
-	def("NAV_DEBUG", false)
+	for k, v in pairs({
+		NAV_HIP = 3, NAV_FAN_RAYS = 32, NAV_COARSE_RAYS = 10, NAV_FAN_RANGE = 40,
+		NAV_ROOM_RADIUS = 26, NAV_ROOM_CLOSED = 0.7, NAV_OPEN_MIN = 12,
+		NAV_DOOR_MIN = 2.5, NAV_DOOR_MAX = 14, NAV_VERT_MIN = 7,
+		NAV_GRID = 3, NAV_GRID_MAX = 1200, NAV_GRID_TIME = 4,
+		NAV_SMOOTH_LOOK = 8, NAV_STATION_TIME = 16, NAV_SHIFTLOCK = true,
+		PATH_LOOKAHEAD = 4, PATH_REPLAN_DIST = 8, SEPARATION_DIST = 6,
+		SEPARATION_PUSH = 6, LANE_WIDTH = 3, TIGHT_SEP = 2.5,
+	}) do
+		if C[k] == nil then C[k] = v end
+	end
 
 	local V3 = Vector3.new
-	local ZERO = V3(0, 0, 0)
+	local sqrt, floor, clamp = math.sqrt, math.floor, math.clamp
 	local HIPV = V3(0, C.NAV_HIP, 0)
-	local H_LOW, H_HIGH = 2.0, 4.6   -- ray heights above the feet: hop-able obstacle / real wall
+	local LOW, HIGH = V3(0, 2, 0), V3(0, 4.6, 0) -- ray heights above the feet: hop-able / wall
 	local PI2 = math.pi * 2
 
 	local function dbg(...)
 		if C.NAV_DEBUG then print("[nav]", ...) end
 	end
 
-	-- ═══ state ═══════════════════════════════════════════════════════════════════════════════
+	-- ═══ shift lock ═══
+	-- Short bursts of CameraRelative rotation (= shift lock): the bot keeps FACING the goal while it side-steps,
+	-- backs up or slides around a prop, instead of turning away from where it needs to go. Released automatically
+	-- when the burst ends and on unload (the player's original rotation setting is restored).
+	local RunService = game:GetService("RunService")
+	local UGS, savedRotation
+	pcall(function() UGS = UserSettings():GetService("UserGameSettings") end)
+	local lockDir, lockUntil, lockOn = nil, 0, false
+
+	local function lockFace(dir, secs)
+		if not (C.NAV_SHIFTLOCK and UGS) then return end
+		local flat = Vector3.new(dir.X, 0, dir.Z)
+		if flat.Magnitude < 0.1 then return end
+		lockDir, lockUntil = flat.Unit, os.clock() + secs
+	end
+
+	local function lockRelease()
+		if lockOn and UGS then
+			pcall(function() UGS.RotationType = savedRotation or Enum.RotationType.MovementRelative end)
+		end
+		lockOn = false
+	end
+
+	if UGS then
+		RunService:BindToRenderStep("yur1NavShiftLock", Enum.RenderPriority.Camera.Value + 1, function()
+			pcall(function()
+				if lockDir and os.clock() < lockUntil then
+					local cam = workspace.CurrentCamera
+					if not cam then return end
+					if not lockOn then
+						savedRotation, lockOn = UGS.RotationType, true
+					end
+					UGS.RotationType = Enum.RotationType.CameraRelative
+					local p = cam.CFrame.Position
+					cam.CFrame = CFrame.lookAt(p, p + lockDir)
+				elseif lockOn then
+					lockRelease()
+				end
+			end)
+		end)
+		table.insert(B.restores, function()
+			pcall(RunService.UnbindFromRenderStep, RunService, "yur1NavShiftLock")
+			lockRelease()
+		end)
+	end
+
 	local S = {
 		path = nil, idx = 1, goal = nil, planAt = 0, planning = false, token = 0, retryAt = 0,
 		stations = nil, stIdx = 1, stGoal = nil, stSince = 0, lastDoor = nil,
 		stuck = 0, stuckLevel = 0, calm = 0, lastPos = nil, lastStepAt = 0,
 		recoverPoint = nil, recoverUntil = 0, sideDir = 1, forceGridUntil = 0,
 		bad = {}, badCount = 0, doorFail = {}, hist = {}, histAt = 0, failures = 0,
-		wpIdx = nil, wpAt = 0, blockedConn = nil, pathObj = nil, direct = nil,
-		climbing = nil,
+		wpIdx = nil, wpAt = 0, blockedConn = nil, pathObj = nil, direct = nil, climbing = nil,
 	}
 	local scanCache, scanCount = {}, 0
 
-	-- ═══ raycasting ══════════════════════════════════════════════════════════════════════════
+	-- time-sliced yielding (replaces fixed per-frame counters): planners never use more than ~4ms per frame
+	local sliceT = 0
+	local function cancelled(token)
+		if os.clock() - sliceT > 0.004 then
+			task.wait()
+			sliceT = os.clock()
+		end
+		return token ~= S.token or not B.running
+	end
+
+	-- ═══ raycasting ═══
 	local rp, rpAt = nil, 0
-	local function rayParams()
+	local function cast(origin, dir)
 		local now = os.clock()
-		if not rp or now - rpAt > 0.5 then
+		if not rp or now - rpAt > 1 then
 			local list = {}
 			for _, p in ipairs(Players:GetPlayers()) do
 				if p.Character then list[#list + 1] = p.Character end
@@ -94,61 +117,47 @@ return function(B)
 			rp.RespectCanCollide = true
 			rpAt = now
 		end
-		return rp
-	end
-
-	local function cast(origin, dir)
-		return workspace:Raycast(origin, dir, rayParams())
+		return workspace:Raycast(origin, dir, rp)
 	end
 
 	local function groundBelow(x, z, fromY, depth)
 		local hit = cast(V3(x, fromY, z), V3(0, -(depth or 50), 0))
-		return hit and hit.Position or nil
+		return hit and hit.Position
 	end
 
-	-- floor position under a root-level point (falls back to "root minus hip height")
 	local function feetOf(p)
 		local g = groundBelow(p.X, p.Z, p.Y + 1, 30)
-		if g and p.Y - g.Y < 8 then return g end
-		return p - HIPV
+		return (g and p.Y - g.Y < 8) and g or p - HIPV
 	end
 
 	local function cell2(p, g)
-		return (math.floor(p.X / g) + 50000) * 100000 + (math.floor(p.Z / g) + 50000)
+		return (floor(p.X / g) + 50000) * 100000 + (floor(p.Z / g) + 50000)
 	end
 
 	local function dkey(p)
-		return math.floor(p.X / 4) .. ":" .. math.floor(p.Z / 4)
+		return floor(p.X / 4) .. ":" .. floor(p.Z / 4)
 	end
 
-	-- ═══ body probes (all points are FEET level) ═════════════════════════════════════════════
-	-- 0 = clear, 1 = only a low obstacle (can be hopped), 2 = wall. r = side ray offset (body half width)
+	-- ═══ body probes (feet level) ═══
+	-- 0 clear, 1 low obstacle (hop), 2 wall. Side rays (half width r) only check wall height: 4 rays instead of 6.
 	local function wallStatus(a, b, r)
 		local d = b - a
-		local fx, fz = d.X, d.Z
-		local m = math.sqrt(fx * fx + fz * fz)
+		local m = sqrt(d.X * d.X + d.Z * d.Z)
 		if m < 0.05 then return 0 end
-		local offs
+		if cast(a + HIGH, d) then return 2 end
+		local status = cast(a + LOW, d) and 1 or 0
 		if r and r > 0 then
-			local s = V3(-fz / m * r, 0, fx / m * r)
-			offs = {ZERO, s, -s}
-		else
-			offs = {ZERO}
-		end
-		local status = 0
-		for i = 1, #offs do
-			local oa = a + offs[i]
-			if cast(oa + V3(0, H_HIGH, 0), d) then return 2 end
-			if status == 0 and cast(oa + V3(0, H_LOW, 0), d) then status = 1 end
+			local s = V3(-d.Z / m * r, 0, d.X / m * r)
+			if cast(a + s + HIGH, d) or cast(a - s + HIGH, d) then return 2 end
 		end
 		return status
 	end
 
-	-- floor samples along the segment: no holes, no cliff faces, no huge drops. returns ok, needsJump
+	-- floor samples every ~4 studs: no holes, cliffs or big drops. returns ok, needsJump
 	local function groundOK(a, b)
 		local d = b - a
-		local flat = math.sqrt(d.X * d.X + d.Z * d.Z)
-		local n = math.clamp(math.ceil(flat / 3), 1, 12)
+		local flat = sqrt(d.X * d.X + d.Z * d.Z)
+		local n = clamp(math.ceil(flat / 4), 1, 10)
 		local topY = math.max(a.Y, b.Y) + 4.5
 		local prevY, needJump = a.Y, false
 		for i = 1, n do
@@ -163,37 +172,34 @@ return function(B)
 		return true, needJump
 	end
 
-	-- full check: walls (several heights, centre + sides) + floor. returns clear, needsJump
 	local function probe(a, b, r)
 		local st = wallStatus(a, b, r or 1.4)
 		if st == 2 then return false, false end
 		local ok, nj = groundOK(a, b)
 		if not ok then return false, false end
-		return true, (st == 1) or (nj == true)
+		return true, st == 1 or nj == true
 	end
 
-	-- free space around a floor point (4 rays at torso height)
-	local CLR_DIRS = {V3(1, 0, 0), V3(-1, 0, 0), V3(0, 0, 1), V3(0, 0, -1)}
+	local CLR = {V3(3, 0, 0), V3(-3, 0, 0), V3(0, 0, 3), V3(0, 0, -3)}
 	local function clearance(p)
-		local m = 3
-		local o = p + V3(0, 3.2, 0)
+		local m, o = 3, p + V3(0, 3.2, 0)
 		for i = 1, 4 do
-			local h = cast(o, CLR_DIRS[i] * 3)
+			local h = cast(o, CLR[i])
 			if h and h.Distance < m then m = h.Distance end
 		end
 		return m
 	end
 
-	-- ═══ 360 degree scan: rooms and exits ════════════════════════════════════════════════════
+	-- ═══ rooms and exits ═══
 	local function fan(origin, n, range)
-		local rays = {}
+		local rays = table.create(n)
 		for i = 0, n - 1 do
 			local a = i / n * PI2
 			local dir = V3(math.cos(a), 0, math.sin(a))
 			local d = range
-			local h1 = cast(origin + V3(0, H_HIGH, 0), dir * range)
+			local h1 = cast(origin + HIGH, dir * range)
 			if h1 then d = h1.Distance end
-			local h2 = cast(origin + V3(0, H_LOW, 0), dir * d)
+			local h2 = cast(origin + LOW, dir * d)
 			if h2 and h2.Distance < d then d = h2.Distance end
 			rays[i + 1] = {dir = dir, dist = d, pos = origin + dir * d}
 		end
@@ -202,22 +208,19 @@ return function(B)
 
 	local function cacheScan(ck, res)
 		scanCount += 1
-		if scanCount > 200 then scanCache, scanCount = {}, 0 end
+		if scanCount > 150 then scanCache, scanCount = {}, 0 end
 		scanCache[ck] = res
 		return res
 	end
 
-	-- returns {rays, exits, isRoom, med, closedFrac}; exits = {pos, dir, width, kind, outer, key}
-	-- Two stages: a cheap coarse scan first (open areas stop here: no exits, not a room), and the full
-	-- scan only when the coarse one already looks room-like. fresh = true always does the full scan.
+	-- cheap coarse scan first; the full scan only runs when it already looks room-like
 	local function analyze(origin, fresh)
 		local now = os.clock()
 		local ck = cell2(origin, 4)
 		local c = scanCache[ck]
-		if c and not fresh and now - c.t < 8 then return c end
+		if c and not fresh and now - c.t < 10 then return c end
 
 		local N, R = C.NAV_FAN_RAYS, C.NAV_FAN_RANGE
-
 		if not fresh then
 			local coarse = fan(origin, C.NAV_COARSE_RAYS, R)
 			local short = 0
@@ -225,10 +228,7 @@ return function(B)
 				if coarse[i].dist < C.NAV_ROOM_RADIUS then short += 1 end
 			end
 			if short / #coarse < C.NAV_ROOM_CLOSED - 0.25 then
-				return cacheScan(ck, {
-					rays = coarse, exits = {}, med = R, t = now, origin = origin,
-					closedFrac = short / #coarse, isRoom = false,
-				})
+				return cacheScan(ck, {rays = coarse, exits = {}, med = R, t = now, isRoom = false})
 			end
 		end
 
@@ -242,29 +242,24 @@ return function(B)
 		local med = ds[math.ceil(N / 2)]
 		local openAt = math.max(C.NAV_OPEN_MIN, med * 1.6)
 
-		local exits = {}
-		local start
+		local exits, start = {}, nil
 		for i = 1, N do
 			if rays[i].dist < openAt then start = i; break end
 		end
 		if start then
 			local i = 0
 			while i < N do
-				local idx = (start - 1 + i) % N + 1
-				if rays[idx].dist >= openAt then
+				if rays[(start - 1 + i) % N + 1].dist >= openAt then
 					local len = 0
 					while i + len < N and rays[(start - 1 + i + len) % N + 1].dist >= openAt do len += 1 end
-					local ra = rays[(start - 1 + i - 1) % N + 1]   -- closed ray before the run
-					local rb = rays[(start - 1 + i + len) % N + 1] -- closed ray after the run
+					local ra = rays[(start - 1 + i - 1) % N + 1]
+					local rb = rays[(start - 1 + i + len) % N + 1]
 					local width = flatDist(ra.pos, rb.pos)
-					local mid = rays[(start - 1 + i + math.floor((len - 1) / 2)) % N + 1]
-					local dist = (ra.dist + rb.dist) / 2
-					local pos = origin + mid.dir * dist
 					if width >= C.NAV_DOOR_MIN then
+						local mid = rays[(start - 1 + i + floor((len - 1) / 2)) % N + 1]
+						local pos = origin + mid.dir * ((ra.dist + rb.dist) / 2)
 						exits[#exits + 1] = {
-							pos = pos, dir = mid.dir, width = width,
-							kind = width <= C.NAV_DOOR_MAX and "door" or "open",
-							outer = pos + mid.dir * 7, key = dkey(pos),
+							pos = pos, width = width, outer = pos + mid.dir * 7, key = dkey(pos),
 						}
 					end
 					i += len
@@ -275,140 +270,125 @@ return function(B)
 		end
 
 		return cacheScan(ck, {
-			rays = rays, exits = exits, med = med, t = now, origin = origin,
-			closedFrac = closedCnt / N,
+			rays = rays, exits = exits, med = med, t = now,
 			isRoom = (closedCnt / N >= C.NAV_ROOM_CLOSED) and med < C.NAV_ROOM_RADIUS,
 		})
 	end
 
-	-- is point p inside the line of sight of a scan taken at origin (works for coarse and full scans)
 	local function visible(an, origin, p)
 		local N = #an.rays
 		local dx, dz = p.X - origin.X, p.Z - origin.Z
-		local m = math.sqrt(dx * dx + dz * dz)
+		local m = sqrt(dx * dx + dz * dz)
 		if m < 1 then return true end
 		local ang = math.atan2(dz, dx)
 		if ang < 0 then ang += PI2 end
-		local idx = math.floor(ang / PI2 * N + 0.5) % N + 1
-		return an.rays[idx].dist >= m - 1.5
+		return an.rays[floor(ang / PI2 * N + 0.5) % N + 1].dist >= m - 1.5
 	end
 
 	local function snapOut(p)
 		return groundBelow(p.X, p.Z, p.Y + 4, 30) or p
 	end
 
-	-- ═══ ladders (vertical routes) ═══════════════════════════════════════════════════════════
-	local trussList, trussAt = {}, -100
+	-- ═══ ladders (list is built once, then kept current by events) ═══
+	local trussSet, trussReady = {}, false
 	local function trusses()
-		local now = os.clock()
-		if now - trussAt > 60 then
-			trussAt, trussList = now, {}
+		if not trussReady then
+			trussReady = true
 			for _, d in ipairs(workspace:GetDescendants()) do
-				if d:IsA("TrussPart") then trussList[#trussList + 1] = d end
+				if d:IsA("TrussPart") then trussSet[d] = true end
 			end
+			table.insert(B.conns, workspace.DescendantAdded:Connect(function(d)
+				if d:IsA("TrussPart") then trussSet[d] = true end
+			end))
+			table.insert(B.conns, workspace.DescendantRemoving:Connect(function(d)
+				trussSet[d] = nil
+			end))
 		end
-		return trussList
+		return trussSet
 	end
 
-	-- best ladder for getting from feet to goalFeet when they are on different floors.
-	-- returns a station {pos = foot of the ladder, climb = {truss, exit, out}, key} or nil
 	local function findClimb(feet, goalFeet)
 		local up = goalFeet.Y > feet.Y
 		local best, bs
-		for _, t in ipairs(trusses()) do
-			if t.Parent and t.CanCollide ~= nil then
-				local sz = t.Size
-				if sz.Y >= sz.X and sz.Y >= sz.Z then -- only (roughly) vertical ladders
-					local half = V3(0, sz.Y / 2, 0)
-					local lo = t.Position - half
-					local hi = t.Position + half
-					local enter, exit = lo, hi
-					if not up then enter, exit = hi, lo end
-
-					-- the ladder must actually end near the goal's height
-					local heightErr = math.abs(exit.Y - goalFeet.Y)
-					if heightErr < math.abs(feet.Y - goalFeet.Y) - 3 then
-						local sc = flatDist(feet, enter) + flatDist(exit, goalFeet) + heightErr * 2
-							+ (S.doorFail["t" .. dkey(t.Position)] or 0) * 60
-						if not bs or sc < bs then best, bs = {t = t, enter = enter, exit = exit}, sc end
-					end
+		for t in pairs(trusses()) do
+			local sz = t.Size
+			if sz.Y >= sz.X and sz.Y >= sz.Z then
+				local half = V3(0, sz.Y / 2, 0)
+				local enter, exit = t.Position - half, t.Position + half
+				if not up then enter, exit = exit, enter end
+				local heightErr = math.abs(exit.Y - goalFeet.Y)
+				if heightErr < math.abs(feet.Y - goalFeet.Y) - 3 then
+					local sc = flatDist(feet, enter) + flatDist(exit, goalFeet) + heightErr * 2
+						+ (S.doorFail["t" .. dkey(t.Position)] or 0) * 60
+					if not bs or sc < bs then best, bs = {t = t, enter = enter, exit = exit}, sc end
 				end
 			end
 		end
 		if not best then return nil end
 
-		-- stand a bit away from the ladder on the side we come from, leave on the side of the goal
 		local tp = best.t.Position
-		local comeDir = V3(feet.X - tp.X, 0, feet.Z - tp.Z)
-		comeDir = comeDir.Magnitude > 0.1 and comeDir.Unit or V3(0, 0, 1)
-		local goDir = V3(goalFeet.X - tp.X, 0, goalFeet.Z - tp.Z)
-		goDir = goDir.Magnitude > 0.1 and goDir.Unit or comeDir
+		local come = V3(feet.X - tp.X, 0, feet.Z - tp.Z)
+		come = come.Magnitude > 0.1 and come.Unit or V3(0, 0, 1)
+		local go = V3(goalFeet.X - tp.X, 0, goalFeet.Z - tp.Z)
+		go = go.Magnitude > 0.1 and go.Unit or come
 
-		local footPos = V3(tp.X, best.enter.Y, tp.Z) + comeDir * 2.5
-		local foot = snapOut(footPos + V3(0, 3, 0))
-		local exitPos = V3(tp.X, best.exit.Y, tp.Z) + goDir * 3
 		return {
-			pos = foot, door = false, key = "t" .. dkey(tp),
-			climb = {truss = best.t, exit = exitPos, out = goDir, up = up},
+			pos = snapOut(V3(tp.X, best.enter.Y, tp.Z) + come * 2.5 + V3(0, 3, 0)),
+			key = "t" .. dkey(tp),
+			climb = {truss = best.t, exit = V3(tp.X, best.exit.Y, tp.Z) + go * 3, up = up},
 		}
 	end
 
-	-- route through real exits: leave our room by its best exit, enter the goal's room by its best exit.
-	-- a dead-end room (ONE exit) simply has a single candidate.
-	-- Different floors: a ladder station comes first (rooms are only analysed on the same floor).
+	-- route through real exits (leave our room, enter the goal's room); ladder first on different floors
 	local function computeStations(feet, goalFeet)
-		local list = {}
-		local cur = feet
+		local list, cur = {}, feet
 
 		if math.abs(goalFeet.Y - feet.Y) > C.NAV_VERT_MIN then
 			local climb = findClimb(feet, goalFeet)
-			if climb then
-				dbg("ladder route", climb.key)
-				list[1] = climb
-				return list
+			if climb then return {climb} end
+		end
+
+		local function bestExit(an, score)
+			local best, bs
+			for _, e in ipairs(an.exits) do
+				local sc = score(e) + (S.doorFail[e.key] or 0) * 40
+				if not bs or sc < bs then best, bs = e, sc end
 			end
+			return best
 		end
 
 		local aS = analyze(feet)
 		if aS.isRoom and #aS.exits > 0 and not visible(aS, feet, goalFeet) then
-			local best, bs
-			for _, e in ipairs(aS.exits) do
-				local sc = flatDist(feet, e.pos) + flatDist(e.outer, goalFeet) + (S.doorFail[e.key] or 0) * 40
-				if e.key == S.lastDoor then sc -= 10 end
-				if not bs or sc < bs then best, bs = e, sc end
-			end
-			if best then
-				S.lastDoor = best.key
-				list[#list + 1] = {pos = snapOut(best.pos), door = true, key = best.key}
-				list[#list + 1] = {pos = snapOut(best.outer), door = true, key = best.key}
+			local e = bestExit(aS, function(e)
+				return flatDist(feet, e.pos) + flatDist(e.outer, goalFeet) - (e.key == S.lastDoor and 10 or 0)
+			end)
+			if e then
+				S.lastDoor = e.key
+				list[#list + 1] = {pos = snapOut(e.pos), door = true, key = e.key}
+				list[#list + 1] = {pos = snapOut(e.outer), door = true, key = e.key}
 				cur = list[#list].pos
-				dbg("leaving room via", best.key, "exits:", #aS.exits)
 			end
 		end
 
 		local aG = analyze(goalFeet)
 		if aG.isRoom and #aG.exits > 0 and not visible(aG, goalFeet, cur) then
-			local best, bs
-			for _, e in ipairs(aG.exits) do
-				local sc = flatDist(cur, e.outer) + flatDist(e.pos, goalFeet) + (S.doorFail[e.key] or 0) * 40
-				if not bs or sc < bs then best, bs = e, sc end
-			end
-			if best then
-				list[#list + 1] = {pos = snapOut(best.outer), door = true, key = best.key}
-				list[#list + 1] = {pos = snapOut(best.pos), door = true, key = best.key}
-				dbg("entering goal room via", best.key, "exits:", #aG.exits, aG.exits[2] and "" or "(dead end)")
+			local e = bestExit(aG, function(e)
+				return flatDist(cur, e.outer) + flatDist(e.pos, goalFeet)
+			end)
+			if e then
+				list[#list + 1] = {pos = snapOut(e.outer), door = true, key = e.key}
+				list[#list + 1] = {pos = snapOut(e.pos), door = true, key = e.key}
 			end
 		end
 		return list
 	end
 
-	-- ═══ planners ════════════════════════════════════════════════════════════════════════════
-	-- binary heap
+	-- ═══ planners ═══
 	local function heapPush(h, item)
 		local n = #h + 1
 		h[n] = item
 		while n > 1 do
-			local p = math.floor(n / 2)
+			local p = n // 2
 			if h[p].f <= h[n].f then break end
 			h[p], h[n] = h[n], h[p]
 			n = p
@@ -416,8 +396,7 @@ return function(B)
 	end
 
 	local function heapPop(h)
-		local top = h[1]
-		local last = h[#h]
+		local top, last = h[1], h[#h]
 		h[#h] = nil
 		local n = #h
 		if n > 0 then
@@ -440,43 +419,39 @@ return function(B)
 		{1, 1, 1.4142}, {1, -1, 1.4142}, {-1, 1, 1.4142}, {-1, -1, 1.4142},
 	}
 
-	-- raycast A*; runs over several frames. returns list, tag ("full" / "partial" / "none" / "cancelled")
+	-- raycast A*, time-sliced. returns list, "full" | "partial" | "none" | "cancelled"
 	local function gridPlan(feet, target, token)
 		local G = C.NAV_GRID
 		local nodes, clr, heap = {}, {}, {}
 		local t0 = os.clock()
 
 		local function keyOf(ix, iz, y)
-			local layer = math.clamp(math.floor(y / 8 + 0.5), -60, 60)
-			return ((ix + 8192) * 16384 + (iz + 8192)) * 128 + (layer + 64)
+			return ((ix + 8192) * 16384 + (iz + 8192)) * 128 + (clamp(floor(y / 8 + 0.5), -60, 60) + 64)
 		end
 		local function h(p)
 			return flatDist(p, target) + math.abs(p.Y - target.Y) * 0.5
 		end
 
-		local sx, sz = math.floor(feet.X / G), math.floor(feet.Z / G)
+		local sx, sz = floor(feet.X / G), floor(feet.Z / G)
 		local startKey = keyOf(sx, sz, feet.Y)
 		local start = {pos = feet, g = 0, ix = sx, iz = sz, key = startKey}
 		nodes[startKey] = start
 		heapPush(heap, {f = h(feet), key = startKey})
-		local best, bestH = start, h(feet)
-		local startH = bestH
-		local expanded, slice = 0, 0
+		local best, startH = start, h(feet)
+		local bestH, expanded = startH, 0
 
 		local function finish(node, finalPoint)
-			local list = {}
-			local cur = node
+			local list, cur = {}, node
 			while cur and cur ~= start do
 				table.insert(list, 1, {pos = cur.pos, jump = cur.jump == true})
-				cur = cur.parent and nodes[cur.parent] or nil
+				cur = cur.parent and nodes[cur.parent]
 			end
 			if finalPoint then list[#list + 1] = {pos = finalPoint, jump = false} end
 			return list
 		end
 
 		while #heap > 0 do
-			local item = heapPop(heap)
-			local node = nodes[item.key]
+			local node = nodes[heapPop(heap).key]
 			if node and not node.closed then
 				node.closed = true
 				expanded += 1
@@ -484,11 +459,10 @@ return function(B)
 				local hv = h(node.pos)
 				if hv < bestH then best, bestH = node, hv end
 
-				if flatDist(node.pos, target) < G * 3.2 and math.abs(node.pos.Y - target.Y) < 8 then
-					local ok = probe(node.pos, target, 1.2)
-					if ok then return finish(node, target), "full" end
+				if flatDist(node.pos, target) < G * 3.2 and math.abs(node.pos.Y - target.Y) < 8
+					and probe(node.pos, target, 1.2) then
+					return finish(node, target), "full"
 				end
-
 				if expanded > C.NAV_GRID_MAX or os.clock() - t0 > C.NAV_GRID_TIME then break end
 
 				local now = os.clock()
@@ -504,9 +478,9 @@ return function(B)
 								local c = clr[nk]
 								if c == nil then c = clearance(g); clr[nk] = c end
 								if c >= 0.9 then
-									local st = wallStatus(node.pos, g, d[3] > 1 and 1.0 or 0)
+									local st = wallStatus(node.pos, g, d[3] > 1 and 1 or 0)
 									if st < 2 then
-										local jumpEdge = (st == 1) or rise > 1.7
+										local jumpEdge = st == 1 or rise > 1.7
 										local cost = G * d[3]
 										if jumpEdge then cost += G * 1.5 end
 										if c < 3 then cost += (3 - c) * 1.2 end
@@ -527,80 +501,65 @@ return function(B)
 						end
 					end
 				end
-
-				slice += 1
-				if slice >= C.NAV_SLICE then
-					slice = 0
-					task.wait()
-					if token ~= S.token or not B.running then return nil, "cancelled" end
-				end
+				if cancelled(token) then return nil, "cancelled" end
 			end
 		end
 
-		-- goal not reachable / budget used: walk to the closest explored point
-		if best ~= start and startH - bestH > G * 2 then
-			return finish(best, nil), "partial"
-		end
+		if best ~= start and startH - bestH > G * 2 then return finish(best), "partial" end
 		return nil, "none"
 	end
 
-	-- PathfindingService with several radii and alternate targets. returns list, pathObject
 	local function robloxPlan(rootPos, target, alt)
 		local function try(radius, tgt)
 			local path = PathfindingService:CreatePath({
 				AgentRadius = radius, AgentHeight = 5, AgentCanJump = true, AgentCanClimb = true, WaypointSpacing = 4,
 			})
-			local ok = pcall(function() path:ComputeAsync(rootPos, tgt) end)
-			if ok and path.Status == Enum.PathStatus.Success then
+			if pcall(path.ComputeAsync, path, rootPos, tgt) and path.Status == Enum.PathStatus.Success then
 				return path, path:GetWaypoints()
 			end
 		end
-		local function snap(p)
-			return groundBelow(p.X, p.Z, p.Y + 4, 40) or p
-		end
+		local function snap(p) return groundBelow(p.X, p.Z, p.Y + 4, 40) or p end
 
-		local foundPath, wps
+		local path, wps
 		local primary = snap(target)
 		for _, radius in ipairs({3 + math.min(S.failures, 2), 2, 1.5}) do
-			foundPath, wps = try(radius, primary)
-			if foundPath then break end
+			path, wps = try(radius, primary)
+			if path then break end
 		end
-		if not foundPath then
+		if not path then
 			local others = {}
-			if alt then others[#others + 1] = snap(alt) end
+			if alt then others[1] = snap(alt) end
 			for _, o in ipairs({V3(4, 0, 0), V3(-4, 0, 0), V3(0, 0, 4), V3(0, 0, -4), V3(7, 0, 7), V3(-7, 0, -7)}) do
 				others[#others + 1] = snap(target + o)
 			end
 			for _, tgt in ipairs(others) do
-				foundPath, wps = try(2, tgt)
-				if foundPath then break end
+				path, wps = try(2, tgt)
+				if path then break end
 			end
 		end
-		if not foundPath then return nil end
+		if not path then return nil end
 
 		local list = {}
 		for i = 2, #wps do
 			list[#list + 1] = {pos = wps[i].Position, jump = wps[i].Action == Enum.PathWaypointAction.Jump}
 		end
 		if #list == 0 then list[1] = {pos = primary, jump = false} end
-		return list, foundPath
+		return list, path
 	end
 
-	-- string-pulling: skip waypoints the multi-ray probe says we can walk straight past
-	local function smooth(list, feet)
-		local out, anchor, k, n, probes = {}, feet, 1, #list, 0
-		local LOOK = C.NAV_SMOOTH_LOOK
+	-- string-pulling: skip waypoints the probe says we can walk straight past
+	local function smooth(list, feet, token)
+		local out, anchor, k, n = {}, feet, 1, #list
 		while k <= n do
 			local best = k
-			for j = math.min(n, k + LOOK), k + 1, -1 do
+			for j = math.min(n, k + C.NAV_SMOOTH_LOOK), k + 1, -1 do
 				local noSkip = false
 				for m = k, j - 1 do
 					if list[m].jump then noSkip = true; break end
 				end
 				if not noSkip and flatDist(anchor, list[j].pos) < 45 then
 					local ok, nj = probe(anchor, list[j].pos, 1.4)
-					probes += 1
-					if probes % 6 == 0 then task.wait() end
+					if cancelled(token) then return nil end
 					if ok and not nj then best = j; break end
 				end
 			end
@@ -611,13 +570,10 @@ return function(B)
 		return out
 	end
 
-	-- ═══ state helpers ═══════════════════════════════════════════════════════════════════════
+	-- ═══ state helpers ═══
 	local function invalidate()
-		S.path = nil
-		S.idx = 1
+		S.path, S.idx, S.retryAt, S.wpIdx = nil, 1, 0, nil
 		S.token += 1
-		S.retryAt = 0
-		S.wpIdx = nil
 	end
 
 	local function markBad(feet, now)
@@ -644,9 +600,7 @@ return function(B)
 	end
 
 	local function planAsync(rootPos, goalRoot, alt)
-		S.planning = true
-		S.planAt = os.clock()
-		S.goal = goalRoot
+		S.planning, S.planAt, S.goal = true, os.clock(), goalRoot
 		local token = S.token
 		task.spawn(function()
 			local ok, err = pcall(function()
@@ -662,23 +616,18 @@ return function(B)
 				local st = S.stations[S.stIdx]
 				local target = st and st.pos or goalFeet
 
-				local list, pathObj, how
+				local list, pathObj
 				if os.clock() >= S.forceGridUntil then
 					list, pathObj = robloxPlan(rootPos, target, (not st) and alt or nil)
-					how = "roblox"
 				end
 				if token ~= S.token or not B.running then return end
-				if not list then
-					list, how = gridPlan(feet, target, token)
-					pathObj = nil
-				end
+				if not list then list = gridPlan(feet, target, token) end
 				if token ~= S.token or not B.running then return end
 
 				if list and #list > 0 then
-					list = smooth(list, feet)
-					if token ~= S.token or not B.running then return end
-					S.path, S.idx, S.wpIdx, S.wpAt = list, 1, nil, 0
-					S.failures = 0
+					list = smooth(list, feet, token)
+					if not list or token ~= S.token or not B.running then return end
+					S.path, S.idx, S.wpIdx, S.wpAt, S.failures = list, 1, nil, 0, 0
 					if S.blockedConn then pcall(function() S.blockedConn:Disconnect() end); S.blockedConn = nil end
 					S.pathObj = pathObj
 					if pathObj then
@@ -688,12 +637,10 @@ return function(B)
 							end
 						end)
 					end
-					dbg("path", how, #list, "waypoints", st and "(station)" or "(goal)")
 				else
-					S.retryAt = os.clock() + 0.8
+					S.retryAt = os.clock() + 0.4
 					S.failures += 1
 					failStation(st)
-					dbg("no path", st and "station failed" or "goal")
 				end
 			end)
 			if not ok then
@@ -704,12 +651,11 @@ return function(B)
 		end)
 	end
 
-	-- ═══ moving ══════════════════════════════════════════════════════════════════════════════
-	-- tight spaces (B.tight, set by the main script) use a small separation radius so bots in a doorway
-	-- don't shove each other back out of it
-	local function separation(pos)
-		local sd = B.tight and (C.TIGHT_SEP or 2.5) or C.SEPARATION_DIST
-		local push = V3(0, 0, 0)
+	-- ═══ moving ═══
+	local function applySep(pos, pt, goal)
+		if flatDist(pos, goal) <= 3 then return pt end
+		local sd = B.tight and C.TIGHT_SEP or C.SEPARATION_DIST
+		local push
 		for _, p in ipairs(Players:GetPlayers()) do
 			if p ~= lp and isBot(p) then
 				local _, r = getParts(p)
@@ -721,59 +667,49 @@ return function(B)
 							off = V3(math.random() - 0.5, 0, math.random() - 0.5)
 							d = off.Magnitude + 0.01
 						end
-						push += off.Unit * ((sd - d) / sd)
+						push = (push or V3(0, 0, 0)) + off.Unit * ((sd - d) / sd)
 					end
 				end
 			end
 		end
-		return push
+		return push and pt + push * C.SEPARATION_PUSH or pt
 	end
 
-	local function applySep(pos, pt, goal)
-		if flatDist(pos, goal) <= 3 then return pt end
-		local sep = separation(pos)
-		if sep.Magnitude < 0.01 then return pt end
-		return pt + sep * C.SEPARATION_PUSH
-	end
-
-	-- whiskers: if something blocks the way (a door, a prop) slide toward the freer side
+	-- whiskers: slide toward the freer side when something blocks the way
+	local WHISK = {0.5, -0.5, 1.0, -1.0, 1.5, -1.5}
 	local function steer(feet, point)
 		local d = V3(point.X - feet.X, 0, point.Z - feet.Z)
 		local m = d.Magnitude
 		if m < 1 then return point end
-		local dir = d / m
-		local look = math.min(m, 7)
+		local dir, look = d / m, math.min(m, 7)
 		local o = feet + V3(0, 3, 0)
 		local centre = cast(o, dir * look)
 		if not centre then return point end
 
-		local function whisker(a)
+		local best, bestD = nil, centre.Distance
+		for _, a in ipairs(WHISK) do
 			local cs, sn = math.cos(a), math.sin(a)
 			local v = V3(dir.X * cs - dir.Z * sn, 0, dir.X * sn + dir.Z * cs)
 			local h = cast(o, v * look)
-			return v, h and h.Distance or look
-		end
-		local best, bestD = nil, centre.Distance
-		for _, a in ipairs({0.5, -0.5, 1.0, -1.0, 1.5, -1.5}) do
-			local v, dist = whisker(a)
+			local dist = h and h.Distance or look
 			if dist > bestD + 1 then best, bestD = v, dist end
 		end
-		if best then return feet + best * math.max(look, 4) end
+		if best then
+			lockFace(dir, 0.4) -- slide around the obstacle without turning away from the goal
+			return feet + best * math.max(look, 4)
+		end
 		return point
 	end
 
-	-- low obstacle right in front: hop it
 	local function autoJump(hum, feet, point)
 		local d = V3(point.X - feet.X, 0, point.Z - feet.Z)
 		local m = d.Magnitude
 		if m < 0.5 then return end
 		local dir = d / m
-		if cast(feet + V3(0, H_LOW, 0), dir * 3) and not cast(feet + V3(0, H_HIGH, 0), dir * 3) then
-			jump(hum)
-		end
+		if cast(feet + LOW, dir * 3) and not cast(feet + HIGH, dir * 3) then jump(hum) end
 	end
 
-	-- escalating recovery when the bot stops moving
+	-- escalating recovery: side-step -> back-track -> escape opening -> force grid planner
 	local function escalate(feet, aim, hum, now)
 		S.stuckLevel += 1
 		S.calm = 0
@@ -786,7 +722,7 @@ return function(B)
 		local right = V3(-d.Z, 0, d.X)
 
 		if lvl == 1 then
-			for _ = 1, 2 do -- side-step, try the other side if that one is a wall
+			for _ = 1, 2 do
 				S.sideDir = -S.sideDir
 				local p = feet + right * (5 * S.sideDir) - d * 1.5
 				if wallStatus(feet, p, 0.8) < 2 then
@@ -802,7 +738,6 @@ return function(B)
 				S.recoverPoint, S.recoverUntil = feet - d * 6, now + 0.8
 			end
 		elseif lvl == 3 then
-			-- fresh scan: leave through the biggest opening that points toward the goal
 			local an = analyze(feet, true)
 			local bestRay, bs = nil, -math.huge
 			for _, r in ipairs(an.rays) do
@@ -818,14 +753,13 @@ return function(B)
 		else
 			S.forceGridUntil = now + 8
 		end
+		if lvl <= 2 then lockFace(d, 1.2) end -- side-step / back-track while still facing the goal
 		jump(hum)
-		dbg("stuck level", S.stuckLevel, "maneuver", lvl)
 	end
 
-	-- direct line check, cached for a moment (called every step)
 	local function directClear(feet, goalFeet, now)
 		local c = S.direct
-		if c and now - c.t < 0.15 and (c.from - feet).Magnitude < 1.5 and (c.to - goalFeet).Magnitude < 1.5 then
+		if c and now - c.t < 0.2 and (c.from - feet).Magnitude < 1.5 and (c.to - goalFeet).Magnitude < 1.5 then
 			return c.ok
 		end
 		local ok = probe(feet, goalFeet, 1.5)
@@ -833,71 +767,60 @@ return function(B)
 		return ok
 	end
 
-	-- drive up / down a ladder. returns the point to MoveTo, or nil when the climb is over
-	local function climbStep(feet, hum, now)
+	local function climbStep(feet, now)
 		local cl = S.climbing
 		local t = cl.truss
 		if not t.Parent or now - cl.since > 10 then
-			-- ladder gone or climb failed: penalise it and plan something else
 			S.doorFail[cl.key] = (S.doorFail[cl.key] or 0) + 1
 			S.climbing, S.stations = nil, nil
 			invalidate()
 			return nil
 		end
 
-		local reached = math.abs(feet.Y - cl.exit.Y) < 2.5
-		if reached then
-			-- off the ladder: step out toward the goal side, then re-plan on the new floor
+		if math.abs(feet.Y - cl.exit.Y) < 2.5 then
 			if cl.topAt == math.huge then cl.topAt = now end
 			if now - cl.topAt > 0.4 then
 				S.climbing, S.stations = nil, nil
 				invalidate()
 				S.recoverPoint, S.recoverUntil = nil, 0
 			end
-			return cl.exit + V3(0, C.NAV_HIP, 0)
+			return cl.exit + HIPV
 		end
 		cl.topAt = math.huge
 
-		-- keep pushing into the ladder at the height we want to reach
 		local tp = t.Position
+		if flatDist(feet, tp) > 3.5 then return V3(tp.X, feet.Y + C.NAV_HIP, tp.Z) end
 		local targetY = cl.up and math.max(cl.exit.Y, feet.Y + 6) or math.min(cl.exit.Y, feet.Y - 6)
-		if flatDist(feet, tp) > 3.5 then
-			return V3(tp.X, feet.Y + C.NAV_HIP, tp.Z) -- walk up to the ladder first
-		end
 		return V3(tp.X, targetY + C.NAV_HIP, tp.Z)
 	end
 
-	-- ═══ the step the main script calls ══════════════════════════════════════════════════════
-	-- returns the point to MoveTo, and true when the way to the goal is a clean straight line
+	-- ═══ the step the main script calls ═══
 	local function step(goalRoot, dt, alt)
 		local hum, root = getParts(lp)
 		if not (hum and root) then return goalRoot, true end
 		local now = os.clock()
 		dt = dt or 0.05
 		local rootPos = root.Position
-		local feet = rootPos - HIPV
-		local goalFeet = goalRoot - HIPV
+		local feet, goalFeet = rootPos - HIPV, goalRoot - HIPV
 
-		-- not called for a while (bot was holding still): forget the stuck counters
 		if now - S.lastStepAt > 0.5 then
 			S.stuck, S.lastPos, S.recoverPoint = 0, nil, nil
 		end
 		S.lastStepAt = now
 
-		-- on a ladder: nothing else matters until the climb is done
 		if S.climbing then
 			S.stuck, S.lastPos = 0, nil
-			local p = climbStep(feet, hum, now)
+			local p = climbStep(feet, now)
 			if p then return p, false end
 		end
 
 		if now - S.histAt > 0.5 then
 			S.histAt = now
-			table.insert(S.hist, feet)
+			S.hist[#S.hist + 1] = feet
 			if #S.hist > 8 then table.remove(S.hist, 1) end
 		end
 
-		-- stuck detection
+		-- stuck detection (reacts a bit sooner than before)
 		if S.lastPos and (feet - S.lastPos).Magnitude < 0.2 then
 			S.stuck += dt
 		else
@@ -906,22 +829,19 @@ return function(B)
 			if S.calm > 4 and S.stuckLevel > 0 then S.stuckLevel = 0 end
 		end
 		S.lastPos = feet
-		if S.stuck > 0.45 then jump(hum) end
-		if S.stuck > 0.9 then
+		if S.stuck > 0.35 then jump(hum) end
+		if S.stuck > 0.7 then
 			S.stuck = 0
 			local tgt = S.stations and S.stations[S.stIdx]
 			escalate(feet, tgt and tgt.pos or goalFeet, hum, now)
 		end
-		if S.recoverPoint and now < S.recoverUntil then
-			return S.recoverPoint, false
-		end
+		if S.recoverPoint and now < S.recoverUntil then return S.recoverPoint, false end
 
-		-- station bookkeeping (doors and ladders)
+		-- stations (doors / ladders)
 		local st = S.stations and S.stations[S.stIdx]
 		if st then
 			if flatDist(feet, st.pos) < 2.6 and math.abs(feet.Y - st.pos.Y) < 6 then
 				if st.climb then
-					-- at the foot of the ladder: start climbing
 					S.climbing = {
 						truss = st.climb.truss, exit = st.climb.exit, up = st.climb.up,
 						key = st.key, since = now, topAt = math.huge,
@@ -929,7 +849,7 @@ return function(B)
 					S.stIdx += 1
 					S.stSince = now
 					invalidate()
-					local p = climbStep(feet, hum, now)
+					local p = climbStep(feet, now)
 					if p then return p, false end
 					st = S.stations and S.stations[S.stIdx]
 				else
@@ -957,35 +877,32 @@ return function(B)
 
 		-- 2. plan
 		if not S.planning then
-			local need = false
+			local need
 			if not S.path then
 				need = now >= S.retryAt
 			elseif flatDist(goalRoot, S.goal or goalRoot) > C.PATH_REPLAN_DIST or now - S.planAt > 7 then
-				need = now - S.planAt > 0.6
+				need = now - S.planAt > 0.5
 			end
 			if need then planAsync(rootPos, goalRoot, alt) end
 		end
 
 		local p = S.path
 		if not p or #p == 0 then
-			-- waiting for the planner: edge toward the current target, steering around obstacles
-			local tgt = st and st.pos or goalFeet
-			local out = steer(feet, tgt)
+			local out = steer(feet, st and st.pos or goalFeet)
 			autoJump(hum, feet, out)
 			return applySep(rootPos, out, goalRoot), false
 		end
 
-		-- 3. follow the path
+		-- 3. follow
 		S.idx = math.min(S.idx, #p)
-		while S.idx < #p and flatDist(feet, p[S.idx].pos) < 2.6 and math.abs(feet.Y - p[S.idx].pos.Y) < 6 do
+		while S.idx < #p and flatDist(feet, p[S.idx].pos) < 2.8 and math.abs(feet.Y - p[S.idx].pos.Y) < 6 do
 			S.idx += 1
 		end
 		if S.idx >= #p and flatDist(feet, p[#p].pos) < 2.4 then
 			S.path = nil
-			S.retryAt = now + 0.3
+			S.retryAt = now + 0.2
 			if st then
 				if st.climb then
-					-- reached the ladder foot through the path end: the bookkeeping above starts the climb next step
 					S.retryAt = now
 				else
 					S.stIdx += 1
@@ -996,17 +913,16 @@ return function(B)
 		end
 
 		if S.wpIdx ~= S.idx then S.wpIdx, S.wpAt = S.idx, now end
-		if now - S.wpAt > 3.5 then
+		if now - S.wpAt > 3 then
 			S.failures += 1
 			markBad(feet, now)
 			invalidate()
 			return applySep(rootPos, goalRoot, goalRoot), false
 		end
 
-		-- furthest waypoint (within look-ahead) we can walk straight to
+		-- furthest waypoint within look-ahead that we can walk straight to
 		local pick = S.idx
-		local lastIdx = math.min(#p, S.idx + C.PATH_LOOKAHEAD)
-		for i = lastIdx, S.idx + 1, -1 do
+		for i = math.min(#p, S.idx + C.PATH_LOOKAHEAD), S.idx + 1, -1 do
 			local okSkip = true
 			for j = S.idx, i - 1 do
 				if p[j].jump then okSkip = false; break end
@@ -1021,16 +937,15 @@ return function(B)
 		if p[S.idx].jump and flatDist(feet, p[S.idx].pos) < 6 then jump(hum) end
 		local point = wp.pos
 
-		-- lanes for several bots (not inside doorways / tight spaces). Uses the fair slot from the main script.
+		-- lanes for several bots (off in doorways / tight spaces)
 		if B.botCount > 1 and not B.tight and pick < #p and not wp.jump and not (st and st.door) then
 			local dir = V3(point.X - feet.X, 0, point.Z - feet.Z)
 			if dir.Magnitude > 1 then
 				dir = dir.Unit
-				local right = V3(-dir.Z, 0, dir.X)
 				local slot = B.slotNow and B.slotNow() or B.mySlot
-				local lane = math.clamp((slot - (B.botCount + 1) / 2) * C.LANE_WIDTH, -10, 10)
-				local cand = point + right * lane
-				if wallStatus(feet, cand, 1.0) == 0 then point = cand end
+				local lane = clamp((slot - (B.botCount + 1) / 2) * C.LANE_WIDTH, -10, 10)
+				local cand = point + V3(-dir.Z, 0, dir.X) * lane
+				if wallStatus(feet, cand, 1) == 0 then point = cand end
 			end
 		end
 
@@ -1039,7 +954,7 @@ return function(B)
 		return applySep(rootPos, out, goalRoot), false
 	end
 
-	-- ═══ install ═════════════════════════════════════════════════════════════════════════════
+	-- ═══ install ═══
 	B.navStep = step
 	B.lineClear = function(a, b, wide)
 		local ok, nj = probe(a - HIPV, b - HIPV, wide and 1.5 or 0.6)
@@ -1057,5 +972,5 @@ return function(B)
 		B.navStep, B.lineClear, B.analyze, B.navReset = nil, nil, nil, nil
 	end)
 
-	print("[yur1] nav module active (rooms, exits, ladders, multi-ray probes, grid A*)")
+	print("[yur1] nav module active")
 end
